@@ -1,9 +1,10 @@
 /* ==========================================================================
-   app.js – State Management, Login/Cloud-Sync, Theme & Interaktive UI
+   app.js – State Management, SHA-256 Login/Account-Speicher & Interaktive UI
    ========================================================================== */
 
 const LEGACY_STORAGE_KEY = 'uni_smart_planner_v1';
 const AUTH_SESSION_KEY   = 'uni_smart_planner_session_v1';
+const USERS_REGISTRY_KEY = 'uni_smart_planner_users_v1';
 const THEME_STORAGE_KEY  = 'uni_smart_planner_theme_v1';
 const CLOUD_URL_KEY      = 'uni_smart_planner_cloud_url_v1';
 
@@ -11,28 +12,32 @@ const WEEKDAY_NAMES = ['', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Frei
 const WEEKDAY_SHORT = ['', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
 
 const RELEVANCE_LABELS = {
-  1: '1 – Kaum relevant (Digitalwerkstatt)',
-  2: '2 – Eher gering (untergeordnet)',
-  3: '3 – Normal (Standard)',
-  4: '4 – Wichtig (Klausur-/Bonus-nah)',
-  5: '5 – Sehr wichtig / Pflichtabgabe'
+  1: '1 – Sehr gering',
+  2: '2 – Eher gering',
+  3: '3 – Normal',
+  4: '4 – Wichtig',
+  5: '5 – Sehr wichtig'
 };
 
+let PUBLIC_USERS_FILE = { users: {} }; // Geladen aus ./users.json falls vorhanden
 let SESSION = loadSession();
 let S = loadStateForCurrentUser();
 
 let UI = {
   tab: 'plan',               // 'plan' | 'tasks' | 'subjects' | 'tests' | 'schedule' | 'settings'
+  authMode: 'login',         // 'login' | 'register'
+  authError: '',
   selectedDayStr: toDateStr(new Date()),
   progressModalTaskId: null,
   filterSubjectId: 'all',
   mobileMenuOpen: false,
   cockpitCompact: false,
-  cloudSyncing: false,
+  netlifyAvailable: false,
   cloudStatusMsg: ''
 };
 
 initTheme();
+initPublicUsersAndBackend();
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
@@ -78,42 +83,133 @@ function toggleTheme() {
   showToast(next === 'dark' ? '🌙 Darkmode aktiviert' : '☀️ Lightmode aktiviert');
 }
 
-/* --- Login & Benutzer-Session --- */
+/* --- SHA-256 Passwort-Hashing & Benutzer-Datenbank --- */
+
+function cleanUsername(u) {
+  return String(u || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+}
+
+async function computePasswordHash(username, password) {
+  const cleanUser = cleanUsername(username);
+  const salted = `uni_smart_planner_v1_salt::${cleanUser}::${password}`;
+  if (window.crypto && window.crypto.subtle) {
+    const buf = new TextEncoder().encode(salted);
+    const digest = await window.crypto.subtle.digest('SHA-256', buf);
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+  // Fallback falls file:// ohne WebCrypto
+  let h1 = 0xdeadbeef ^ salted.length, h2 = 0x41c6ce57 ^ salted.length;
+  for (let i = 0, ch; i < salted.length; i++) {
+    ch = salted.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
+}
+
+function getLocalUsersRegistry() {
+  let local = {};
+  try {
+    local = JSON.parse(localStorage.getItem(USERS_REGISTRY_KEY)) || {};
+  } catch (e) {}
+  return Object.assign({}, PUBLIC_USERS_FILE.users || {}, local);
+}
+
+function saveUserToLocalRegistry(username, passHash, stateObj) {
+  const key = cleanUsername(username);
+  let local = {};
+  try {
+    local = JSON.parse(localStorage.getItem(USERS_REGISTRY_KEY)) || {};
+  } catch (e) {}
+  local[key] = {
+    username: String(username).trim(),
+    passHash,
+    updatedAt: Date.now(),
+    state: stateObj || S
+  };
+  try {
+    localStorage.setItem(USERS_REGISTRY_KEY, JSON.stringify(local));
+  } catch (e) {}
+}
+
+async function initPublicUsersAndBackend() {
+  // 1. Lade öffentliche users.json (falls im Projektordner hinterlegt)
+  try {
+    const res = await fetch('users.json', { cache: 'no-store' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && typeof data.users === 'object') {
+        PUBLIC_USERS_FILE = data;
+      }
+    }
+  } catch (e) {}
+
+  // 2. Prüfe, ob Netlify Serverless Backend aktiv ist (/.netlify/functions/api)
+  try {
+    const res = await fetch('/.netlify/functions/api', { method: 'GET' });
+    if (res.ok) {
+      const info = await res.json();
+      if (info && info.ok) {
+        UI.netlifyAvailable = true;
+        UI.cloudStatusMsg = '☁️ Netlify Server aktiv';
+        if (SESSION && SESSION.username && SESSION.passHash) {
+          await syncWithNetlify('login');
+        }
+        render();
+      }
+    }
+  } catch (e) {}
+}
+
+async function syncWithNetlify(action) {
+  if (!UI.netlifyAvailable || !SESSION) return null;
+  try {
+    const res = await fetch('/.netlify/functions/api', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action,
+        username: SESSION.username,
+        passHash: SESSION.passHash,
+        state: S
+      })
+    });
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      if (data.state && action === 'login') {
+        S = normalizeStateObject(data.state);
+        saveState(true);
+        render();
+      }
+      UI.cloudStatusMsg = '☁️ Gespeichert';
+      return { ok: true, data };
+    }
+    return { ok: false, error: data.error || 'Fehler' };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/* --- Session & State --- */
 
 function loadSession() {
   try {
     const s = JSON.parse(localStorage.getItem(AUTH_SESSION_KEY));
-    if (s && s.username) return s;
+    if (s && s.username && s.passHash) return s;
   } catch (e) {}
   return null;
 }
 
 function getUserStorageKey(username) {
-  const clean = String(username || 'default').toLowerCase().replace(/[^a-z0-9_-]/g, '_');
-  return `uni_smart_planner_user_${clean}`;
-}
-
-function simpleHash(str) {
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(16);
-}
-
-function guessSubjectIdByTitle(title, subjects) {
-  const low = (title || '').toLowerCase();
-  for (const s of subjects) {
-    if (low.includes(s.name.toLowerCase())) return s.id;
-  }
-  return subjects[0]?.id || '';
+  return `uni_smart_planner_user_${cleanUsername(username)}`;
 }
 
 function normalizeStateObject(raw) {
-  if (!raw || !Array.isArray(raw.subjects) || !raw.subjects.length) {
+  if (!raw || typeof raw !== 'object') {
     return {
-      subjects: JSON.parse(JSON.stringify(DEFAULT_SUBJECTS)),
+      subjects: [],
       tasks: [],
       tests: [],
       lectures: [],
@@ -124,14 +220,15 @@ function normalizeStateObject(raw) {
     };
   }
 
-  const subjects = raw.subjects.map(s => ({
+  const subjects = (raw.subjects || []).map((s, idx) => ({
     ...s,
+    baseRank: s.baseRank || (idx + 1),
     cp: s.cp !== undefined ? Number(s.cp) : 6
   }));
 
   const lectures = (raw.lectures || []).map(l => ({
     ...l,
-    subjectId: l.subjectId || guessSubjectIdByTitle(l.title, subjects)
+    subjectId: l.subjectId || subjects[0]?.id || ''
   }));
 
   const tasks = (raw.tasks || []).map(t => {
@@ -172,34 +269,38 @@ function loadStateForCurrentUser() {
     raw = JSON.parse(localStorage.getItem(userKey));
   } catch (e) {}
 
-  // Falls dieser User sich zum ersten Mal einloggt und noch Daten im alten Speicher (`uni_smart_planner_v1`) liegen,
-  // automatisch übernehmen, damit nichts verloren geht!
   if (!raw) {
-    try {
-      const legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY));
-      if (legacy && Array.isArray(legacy.subjects)) {
-        raw = legacy;
-        localStorage.setItem(userKey, JSON.stringify(raw));
-      }
-    } catch (e) {}
+    const reg = getLocalUsersRegistry();
+    const entry = reg[cleanUsername(SESSION.username)];
+    if (entry && entry.state) {
+      raw = entry.state;
+    }
   }
 
   return normalizeStateObject(raw);
 }
 
-function saveState(skipCloud = false) {
+let netlifySaveTimer = null;
+function saveState(skipRemote = false) {
   if (!SESSION || !SESSION.username) return;
   S.updatedAt = Date.now();
   const userKey = getUserStorageKey(SESSION.username);
   try {
     localStorage.setItem(userKey, JSON.stringify(S));
   } catch (e) {}
-  if (!skipCloud) {
+
+  saveUserToLocalRegistry(SESSION.username, SESSION.passHash, S);
+
+  if (!skipRemote) {
+    if (UI.netlifyAvailable) {
+      clearTimeout(netlifySaveTimer);
+      netlifySaveTimer = setTimeout(() => syncWithNetlify('save'), 600);
+    }
     pushToCloudIfConfigured();
   }
 }
 
-/* --- Optionaler Cloud-Sync (Firebase Realtime DB / REST JSON) für Handy + Mac über GitHub Pages --- */
+/* --- Optionaler Firebase Cloud-Sync --- */
 
 function getCloudBaseUrl() {
   return (SESSION?.cloudUrl || localStorage.getItem(CLOUD_URL_KEY) || '').trim().replace(/\/+$/, '');
@@ -208,34 +309,29 @@ function getCloudBaseUrl() {
 function getCloudEndpoint() {
   const base = getCloudBaseUrl();
   if (!base || !SESSION || !SESSION.username) return '';
-  const userClean = SESSION.username.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
-  const token = simpleHash(userClean + '__' + (SESSION.passHash || ''));
-  return `${base}/uni_planner_users/${userClean}_${token}.json`;
+  const userClean = cleanUsername(SESSION.username);
+  return `${base}/uni_planner_users/${userClean}_${SESSION.passHash.slice(0, 16)}.json`;
 }
 
 async function pullFromCloudIfConfigured(showFeedback = false) {
   const url = getCloudEndpoint();
   if (!url) return;
-  UI.cloudSyncing = true;
   try {
     const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    if (data && Array.isArray(data.subjects)) {
+    if (data && typeof data === 'object') {
       S = normalizeStateObject(data);
       saveState(true);
       UI.cloudStatusMsg = '☁️ Synchronisiert';
-      if (showFeedback) showToast('☁️ Plan erfolgreich aus der Cloud geladen!');
+      if (showFeedback) showToast('☁️ Plan aus der Cloud geladen!');
       render();
     } else if (data === null) {
-      // Noch kein Stand in der Cloud -> aktuellen Stand hochladen
       await pushToCloudIfConfigured(true);
     }
   } catch (err) {
     UI.cloudStatusMsg = '⚠️ Cloud-Fehler';
     if (showFeedback) showToast('Cloud-Abruf fehlgeschlagen: ' + err.message);
-  } finally {
-    UI.cloudSyncing = false;
   }
 }
 
@@ -251,12 +347,8 @@ function pushToCloudIfConfigured(immediate = false) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(S)
       });
-      if (res.ok) {
-        UI.cloudStatusMsg = '☁️ Gespeichert';
-      }
-    } catch (e) {
-      UI.cloudStatusMsg = '⚠️ Offline';
-    }
+      if (res.ok) UI.cloudStatusMsg = '☁️ Gespeichert';
+    } catch (e) {}
   };
   if (immediate) return run();
   cloudPushTimer = setTimeout(run, 800);
@@ -279,14 +371,14 @@ function showToast(msg) {
 }
 
 function getSubject(subjectId) {
-  return S.subjects.find(s => s.id === subjectId) || S.subjects[0] || { id: '', name: 'Unbekannt', color: '#64748b', baseRank: 99, cp: 6 };
+  return S.subjects.find(s => s.id === subjectId) || S.subjects[0] || { id: '', name: 'Kein Fach', color: '#64748b', baseRank: 1, cp: 6 };
 }
 
-/* --- Login-Ansicht (vor dem Planer) --- */
+/* --- Login & Registrierungs-Fenster --- */
 
 function renderLoginScreen() {
   const isDark = getTheme() === 'dark';
-  const savedCloudUrl = localStorage.getItem(CLOUD_URL_KEY) || '';
+  const isReg = UI.authMode === 'register';
 
   return `
     <div class="login-wrap">
@@ -296,7 +388,7 @@ function renderLoginScreen() {
             <div class="brand-icon">⚡</div>
             <div>
               <h1 style="font-size:19px">Uni Smart-Planer</h1>
-              <div style="font-size:12px;color:var(--mu)">Persönlicher Login & Sync</div>
+              <div style="font-size:12px;color:var(--mu)">${isReg ? 'Neues Benutzerkonto erstellen' : 'Anmelden'}</div>
             </div>
           </div>
           <button class="btn btn-sm" data-action="toggle-theme" title="Design wechseln">
@@ -304,32 +396,32 @@ function renderLoginScreen() {
           </button>
         </div>
 
-        <p style="font-size:13px;color:var(--mu);margin-top:0;margin-bottom:16px">
-          Melde dich mit deinem Namen & Passwort an. Jeder Nutzer bekommt seinen <b>eigenen Stunden- & Lernplan</b>.
-          Optional kannst du unten eine kostenlose Cloud-URL eintragen, um deinen Plan live zwischen <b>Mac & iPhone</b> zu synchronisieren.
-        </p>
+        <div style="display:flex;gap:6px;margin-bottom:16px;background:var(--bg);padding:4px;border-radius:10px;border:1px solid var(--ln)">
+          <button type="button" class="nav-tab ${!isReg ? 'active' : ''}" style="flex:1;justify-content:center" data-action="switch-auth-mode" data-mode="login">
+            🔑 Anmelden
+          </button>
+          <button type="button" class="nav-tab ${isReg ? 'active' : ''}" style="flex:1;justify-content:center" data-action="switch-auth-mode" data-mode="register">
+            ➕ Registrieren
+          </button>
+        </div>
 
-        <form id="login-form" class="form-stack">
+        ${UI.authError ? `
+          <div style="padding:9px 12px;margin-bottom:12px;border-radius:8px;background:var(--rd-soft);color:var(--rd);border:1px solid var(--rd);font-size:13px;font-weight:600">
+            ${esc(UI.authError)}
+          </div>
+        ` : ''}
+
+        <form id="auth-form" class="form-stack">
           <div>
-            <label>Benutzername (z. B. ian)</label>
-            <input type="text" name="username" placeholder="Dein Benutzername" required autocomplete="username">
+            <label>Benutzername</label>
+            <input type="text" name="username" placeholder="Benutzername" required autocomplete="username">
           </div>
           <div>
-            <label>Passwort / PIN</label>
-            <input type="password" name="password" placeholder="Dein Passwort" required autocomplete="current-password">
+            <label>Passwort</label>
+            <input type="password" name="password" placeholder="Passwort" required autocomplete="${isReg ? 'new-password' : 'current-password'}">
           </div>
-          <details style="background:var(--bg);padding:10px 12px;border-radius:9px;border:1px solid var(--ln);font-size:12.5px">
-            <summary style="cursor:pointer;font-weight:600;color:var(--mu)">☁️ Optional: Cloud-Sync URL (für Handy ↔ Mac über GitHub)</summary>
-            <div style="margin-top:8px">
-              <label>Firebase Realtime DB URL (optional)</label>
-              <input type="url" name="cloudUrl" value="${esc(savedCloudUrl)}" placeholder="https://dein-projekt-default-rtdb.europe-west1.firebasedatabase.app">
-              <div style="font-size:11.5px;color:var(--mu);margin-top:4px">
-                Wenn eingetragen, synchronisiert sich dein Account automatisch über alle Geräte hinweg.
-              </div>
-            </div>
-          </details>
           <button type="submit" class="btn btn-primary" style="width:100%;padding:10px;margin-top:4px">
-            🚀 Anmelden & meinen Plan öffnen
+            ${isReg ? 'Konto erstellen & starten' : 'Anmelden'}
           </button>
         </form>
       </div>
@@ -386,7 +478,7 @@ function render() {
           <div class="brand-icon">⚡</div>
           <div>
             <h1>Uni Smart-Planer</h1>
-            <div class="brand-sub">👤 ${esc(SESSION.username)} ${getCloudBaseUrl() ? `· ${UI.cloudStatusMsg || '☁️ Cloud aktiv'}` : '· Lokal gespeichert'}</div>
+            <div class="brand-sub">👤 ${esc(SESSION.username)} ${UI.cloudStatusMsg ? `· ${UI.cloudStatusMsg}` : ''}</div>
           </div>
         </div>
 
@@ -442,20 +534,22 @@ function renderStickyCockpit(plan) {
   const dayObj = plan.days.find(d => d.dateStr === UI.selectedDayStr) || plan.days[0];
   if (!dayObj) return '';
 
-  const pills = dayObj.rankedSubjects.map((r, idx) => {
-    const isBoosted = r.boostScore > 0;
-    const tooltip = r.reasons.length
-      ? `Grund-Score: ${r.baseScore} + Test/Klausur-Boost: +${r.boostScore} (${r.reasons.join(', ')})`
-      : `Grund-Priorität Platz ${r.baseRank} (Score: ${r.baseScore})`;
+  const pills = dayObj.rankedSubjects.length === 0
+    ? `<span style="font-size:12px;color:var(--mu)">Noch keine Fächer angelegt – unter „🏆 Fächer & CP“ eintragen</span>`
+    : dayObj.rankedSubjects.map((r, idx) => {
+        const isBoosted = r.boostScore > 0;
+        const tooltip = r.reasons.length
+          ? `Grund-Score: ${r.baseScore} + Test/Klausur-Boost: +${r.boostScore} (${r.reasons.join(', ')})`
+          : `Grund-Priorität Platz ${r.baseRank} (Score: ${r.baseScore})`;
 
-    return `
-      <div class="prio-pill ${isBoosted ? 'boosted' : ''}" style="--sc:${r.color}" title="${esc(tooltip)}">
-        <span class="rank">${idx + 1}</span>
-        <span>${esc(r.subjectName)}</span>
-        ${isBoosted ? `<span class="boost-tag">🔥 +${r.boostScore}</span>` : ''}
-      </div>
-    `;
-  }).join('');
+        return `
+          <div class="prio-pill ${isBoosted ? 'boosted' : ''}" style="--sc:${r.color}" title="${esc(tooltip)}">
+            <span class="rank">${idx + 1}</span>
+            <span>${esc(r.subjectName)}</span>
+            ${isBoosted ? `<span class="boost-tag">🔥 +${r.boostScore}</span>` : ''}
+          </div>
+        `;
+      }).join('');
 
   const openTasks = S.tasks.filter(t => !t.done && t.remainingMinutes > 0);
   const activeNowTasks = openTasks.filter(t => isTaskEligibleOnDate(t, todayStr, S).eligible);
@@ -488,7 +582,7 @@ function renderStickyCockpit(plan) {
             <div class="stat-card">
               <div class="stat-label">Aktuell einplanbare Aufgaben</div>
               <div class="stat-val">${activeNowTasks.length} aktiv</div>
-              <div class="stat-sub">${deferredCount > 0 ? `+ ${deferredCount} später fällig (z. B. spätere Klausuren)` : 'Alle offenen Aufgaben sind aktiv'}</div>
+              <div class="stat-sub">${deferredCount > 0 ? `+ ${deferredCount} später fällig` : 'Alle offenen Aufgaben sind aktiv'}</div>
             </div>
             <div class="stat-card">
               <div class="stat-label">Eingeplant (nächste ${plan.horizonDays} Tage)</div>
@@ -516,11 +610,21 @@ function renderStickyCockpit(plan) {
   `;
 }
 
-/* --- TAB 1: 10-Tage-Lernplan (Jetzt komplett aufgeräumt über die volle Breite!) --- */
+/* --- TAB 1: 10-Tage-Lernplan (Volle Breite) --- */
 
 function renderPlanView(plan) {
   return `
     <section>
+      ${S.subjects.length === 0 ? `
+        <div class="panel" style="margin-bottom:18px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+          <div>
+            <b>Willkommen in deinem Lernplaner!</b>
+            <div style="font-size:13px;color:var(--mu)">Dein Plan ist noch leer. Lege zuerst unter „🏆 Fächer & CP“ deine Fächer und Prioritäten an.</div>
+          </div>
+          <button class="btn btn-primary" data-action="tab" data-tab="subjects">🏆 Jetzt Fächer anlegen</button>
+        </div>
+      ` : ''}
+
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0;font-size:18px">🗓️ Automatischer Lern- & Terminplan (${plan.horizonDays} Tage)</h2>
@@ -606,14 +710,16 @@ function renderDayColumn(day) {
         </div>
       </div>
 
-      <div class="day-prio-mini" title="Top-Prioritäten an diesem Tag">
-        <span>Top:</span>
-        ${top3.map((r, i) => `
-          <span class="mini-dot" style="--sc:${r.color}">
-            <i></i>${i + 1}. ${esc(r.subjectName)}${r.boostScore > 0 ? '🔥' : ''}
-          </span>
-        `).join(' · ')}
-      </div>
+      ${top3.length > 0 ? `
+        <div class="day-prio-mini" title="Top-Prioritäten an diesem Tag">
+          <span>Top:</span>
+          ${top3.map((r, i) => `
+            <span class="mini-dot" style="--sc:${r.color}">
+              <i></i>${i + 1}. ${esc(r.subjectName)}${r.boostScore > 0 ? '🔥' : ''}
+            </span>
+          `).join(' · ')}
+        </div>
+      ` : ''}
 
       ${day.skippedLecturesToday && day.skippedLecturesToday.length > 0 ? `
         <div style="padding:6px 12px;background:var(--warn-soft);border-bottom:1px solid var(--ln);font-size:12px;display:flex;flex-direction:column;gap:4px">
@@ -649,19 +755,19 @@ function renderSlotItem(slot, day) {
           Prio: ${slot.priorityScore} (Rel ${slot.taskRelevance || 3}/5)${slot.remainingAfterBlock > 0 ? ` · Danach noch ${formatDuration(slot.remainingAfterBlock)} übrig` : ' · Wird hier fertig'}
         </div>
         <div class="slot-actions">
-          <button class="btn btn-sm btn-ok" data-action="task-done" data-id="${slot.taskId}" title="Aufgabe ist komplett fertig – Zeit wird dem Fach gutgeschrieben">
+          <button class="btn btn-sm btn-ok" data-action="task-done" data-id="${slot.taskId}">
             ✓ Fertig
           </button>
-          <button class="btn btn-sm" data-action="block-complete" data-id="${slot.taskId}" data-min="${slot.durationMin}" title="Genau diesen ${slot.durationMin}-Min.-Block als erledigt abziehen & dem Fach gutschreiben">
+          <button class="btn btn-sm" data-action="block-complete" data-id="${slot.taskId}" data-min="${slot.durationMin}">
             ✓ Block (${slot.durationMin}m)
           </button>
-          <button class="btn btn-sm btn-warn" data-action="task-partial" data-id="${slot.taskId}" title="Restzeit anpassen">
+          <button class="btn btn-sm btn-warn" data-action="task-partial" data-id="${slot.taskId}">
             ⏱ Restzeit
           </button>
-          <button class="btn btn-sm" data-action="slot-postpone-day" data-id="${slot.taskId}" data-date="${day.dateStr}" title="Heute streichen und frühestens morgen einplanen">
+          <button class="btn btn-sm" data-action="slot-postpone-day" data-id="${slot.taskId}" data-date="${day.dateStr}">
             ⏭ Später
           </button>
-          <button class="btn btn-sm" data-action="task-postpone-week" data-id="${slot.taskId}" title="In die nächste Woche schieben">
+          <button class="btn btn-sm" data-action="task-postpone-week" data-id="${slot.taskId}">
             📅 Nächste Woche
           </button>
         </div>
@@ -685,15 +791,13 @@ function renderSlotItem(slot, day) {
                   style="${isAttended ? 'background:var(--ok);color:#fff' : ''}"
                   data-action="lec-toggle-attend"
                   data-lecid="${slot.lectureId}"
-                  data-date="${day.dateStr}"
-                  title="Vorlesung als besucht markieren (+${hrsStr} Std. für ${esc(slot.subjectName)})">
+                  data-date="${day.dateStr}">
             ${isAttended ? `✅ Besucht (+${hrsStr} Std. gezählt)` : `✓ Besucht (+${hrsStr} Std.)`}
           </button>
           <button class="btn btn-sm btn-danger"
                   data-action="lec-skip"
                   data-lecid="${slot.lectureId}"
-                  data-date="${day.dateStr}"
-                  title="Diese Woche / an diesem Tag gehe ich nicht hin -> Zeit wird frei für Aufgaben!">
+                  data-date="${day.dateStr}">
             🚫 Gehe ich nicht hin
           </button>
         </div>
@@ -751,9 +855,9 @@ function renderSlotItem(slot, day) {
   return '';
 }
 
-/* --- TAB 2: Eigener Reiter nur für Aufgaben (Eintragen & Verwalten) --- */
+/* --- TAB 2: Aufgaben (Eintragen & Verwalten) --- */
 
-function renderTasksView(plan) {
+function renderTasksView() {
   const todayStr = toDateStr(new Date());
   const openTasks = S.tasks.filter(t => !t.done && (UI.filterSubjectId === 'all' || t.subjectId === UI.filterSubjectId));
   const doneTasks = S.tasks.filter(t => t.done && (UI.filterSubjectId === 'all' || t.subjectId === UI.filterSubjectId));
@@ -765,48 +869,54 @@ function renderTasksView(plan) {
         <div class="panel-head">
           <h2>➕ Neue Aufgabe eintragen</h2>
         </div>
-        <form id="quick-task-form" class="form-stack">
-          <div>
-            <label>Titel der Aufgabe</label>
-            <input type="text" name="title" placeholder="z. B. Übungsblatt 4 / Digitalwerkstatt" required autocomplete="off">
+        ${S.subjects.length === 0 ? `
+          <div class="empty-box">
+            Bitte lege zuerst unter <b>„🏆 Fächer & CP“</b> mindestens ein Fach an, bevor du Aufgaben einträgst.
           </div>
-          <div class="form-grid">
+        ` : `
+          <form id="quick-task-form" class="form-stack">
             <div>
-              <label>Fach</label>
-              <select name="subjectId">
-                ${S.subjects.map(s => `<option value="${s.id}">${esc(s.name)} (Basis #${s.baseRank})</option>`).join('')}
+              <label>Titel der Aufgabe</label>
+              <input type="text" name="title" placeholder="Titel" required autocomplete="off">
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Fach</label>
+                <select name="subjectId">
+                  ${S.subjects.map(s => `<option value="${s.id}">${esc(s.name)} (Basis #${s.baseRank})</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label>Arbeitsaufwand (Minuten)</label>
+                <input type="number" name="minutes" value="60" min="5" max="6000" step="5" required>
+              </div>
+            </div>
+            <div>
+              <label>Relevanz dieser Aufgabe</label>
+              <select name="relevance">
+                <option value="1">1 – Sehr gering</option>
+                <option value="2">2 – Eher gering</option>
+                <option value="3" selected>3 – Normal</option>
+                <option value="4">4 – Wichtig</option>
+                <option value="5">5 – Sehr wichtig</option>
               </select>
             </div>
-            <div>
-              <label>Arbeitsaufwand (Minuten)</label>
-              <input type="number" name="minutes" value="60" min="5" max="6000" step="5" required>
+            <div class="form-grid">
+              <div>
+                <label>Frist / Abgabe (optional)</label>
+                <input type="date" name="due">
+              </div>
+              <div>
+                <label>Gehört zu Test/Klausur (optional)</label>
+                <select name="testId">
+                  <option value="">– Allgemeine Aufgabe –</option>
+                  ${S.tests.filter(t => t.date >= todayStr).map(t => `<option value="${t.id}">${esc(t.title)} (${formatDateNice(t.date)})</option>`).join('')}
+                </select>
+              </div>
             </div>
-          </div>
-          <div>
-            <label>Relevanz dieser Aufgabe (steuert, ob sie andere Fächer überholt oder zurücksteckt)</label>
-            <select name="relevance">
-              <option value="1">1 – Kaum relevant (z. B. Digitalwerkstatt -> rutscht nach hinten)</option>
-              <option value="2">2 – Eher gering (untergeordnet)</option>
-              <option value="3" selected>3 – Normal (Standard-Übungsaufgabe)</option>
-              <option value="4">4 – Wichtig (Klausur-/Bonus-relevant)</option>
-              <option value="5">5 – Sehr wichtig / Pflichtabgabe</option>
-            </select>
-          </div>
-          <div class="form-grid">
-            <div>
-              <label>Frist / Abgabe (optional)</label>
-              <input type="date" name="due">
-            </div>
-            <div>
-              <label>Gehört zu Test/Klausur (optional)</label>
-              <select name="testId">
-                <option value="">– Allgemeine Aufgabe –</option>
-                ${S.tests.filter(t => t.date >= todayStr).map(t => `<option value="${t.id}">${esc(t.title)} (${formatDateNice(t.date)})</option>`).join('')}
-              </select>
-            </div>
-          </div>
-          <button type="submit" class="btn btn-primary" style="width:100%">Aufgabe speichern & in den 10-Tage-Plan einrechnen</button>
-        </form>
+            <button type="submit" class="btn btn-primary" style="width:100%">Aufgabe speichern & in den Plan einrechnen</button>
+          </form>
+        `}
       </section>
 
       <!-- Rechts: Offene & erledigte Aufgaben -->
@@ -820,7 +930,7 @@ function renderTasksView(plan) {
         </div>
 
         <h3 style="font-size:14px;color:var(--mu);margin:8px 0">Offene Aufgaben (${openTasks.length})</h3>
-        ${openTasks.length === 0 ? `<div class="empty-box">Keine offenen Aufgaben in dieser Ansicht.</div>` : `
+        ${openTasks.length === 0 ? `<div class="empty-box">Keine offenen Aufgaben.</div>` : `
           <div class="task-list">
             ${openTasks.map(t => renderTaskCardCompact(t)).join('')}
           </div>
@@ -855,7 +965,7 @@ function renderTasksView(plan) {
   `;
 }
 
-/* --- TAB 3: Eigener Reiter nur für Fächer, Grund-Priorität & CP-Stundenkonto --- */
+/* --- TAB 3: Fächer, Grund-Priorität & CP-Stundenkonto --- */
 
 function renderSubjectsView() {
   const sortedSubjects = [...S.subjects].sort((a, b) => a.baseRank - b.baseRank);
@@ -868,80 +978,83 @@ function renderSubjectsView() {
         <span class="badge">1 CP = ${hoursPerCp} Std. Aufwand</span>
       </div>
       <p style="font-size:13.5px;color:var(--mu);margin-top:0">
-        Hier legst du die <b>Grund-Reihenfolge deiner Fächer</b> sowie deren <b>Credit Points (CP)</b> fest.
-        Die Anzeige <b>Stunden: [bearbeitet] / [erforderlich]</b> summiert automatisch alle erledigten Aufgaben und besuchten Vorlesungen (<b style="color:var(--rd)">Rot</b> = unter Soll, <b style="color:var(--ok)">Grün</b> = Soll erreicht):
+        Hier legst du deine Fächer, deren <b>Grund-Reihenfolge</b> sowie die <b>Credit Points (CP)</b> fest.
+        Die Anzeige <b>Stunden: [bearbeitet]/[erforderlich]</b> summiert alle erledigten Aufgaben und besuchten Vorlesungen (<b style="color:var(--rd)">Rot</b> = unter Soll, <b style="color:var(--ok)">Grün</b> = Soll erreicht):
       </p>
 
-      <div class="task-list" style="margin-bottom:20px">
-        ${sortedSubjects.map((s, idx) => {
-          const acc = computeSubjectHoursAccount(s, S);
-          const workedStr = formatHoursDecimal(acc.totalMinutes);
-          const taskHrsStr = formatHoursDecimal(acc.taskMinutes);
-          const lecHrsStr = formatHoursDecimal(acc.lectureMinutes);
-          const statusColor = acc.isGoalMet ? 'var(--ok)' : 'var(--rd)';
-          const statusBg = acc.isGoalMet ? 'var(--ok-soft)' : 'var(--rd-soft)';
-
-          return `
-            <div class="subj-item" style="--sc:${s.color};flex-direction:column;align-items:stretch;gap:10px">
-              <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
-                <div style="display:flex;align-items:center;gap:10px">
-                  <span class="badge" style="background:${s.color};color:#fff;border:none;font-weight:700">#${idx + 1}</span>
-                  <input type="color" value="${s.color}" data-action="subj-color" data-id="${s.id}" style="width:26px;height:26px;border:0;padding:0;background:none;cursor:pointer">
-                  <b style="font-size:15.5px">${esc(s.name)}</b>
-                </div>
-
-                <div style="display:flex;align-items:center;gap:6px">
-                  <button class="btn btn-sm" data-action="subj-up" data-id="${s.id}" ${idx === 0 ? 'disabled' : ''}>↑ Höher</button>
-                  <button class="btn btn-sm" data-action="subj-down" data-id="${s.id}" ${idx === sortedSubjects.length - 1 ? 'disabled' : ''}>↓ Tiefer</button>
-                </div>
-              </div>
-
-              <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--ln)">
-                <div style="display:flex;align-items:center;gap:8px">
-                  <label style="margin:0;font-size:12.5px">Credit Points (CP):</label>
-                  <input type="number" value="${acc.cp}" min="1" max="30" step="0.5"
-                         data-action="subj-cp" data-id="${s.id}"
-                         style="width:74px;padding:4px 8px;font-size:13px;font-weight:700">
-                </div>
-
-                <div style="text-align:right">
-                  <span style="display:inline-block;padding:5px 12px;border-radius:8px;font-weight:800;font-size:14px;color:${statusColor};background:${statusBg};border:1px solid ${statusColor}">
-                    Stunden: ${workedStr}/${acc.requiredHours}
-                  </span>
-                  <div style="font-size:11.5px;color:var(--mu);margin-top:3px">
-                    (${lecHrsStr} Std. besuchte Vorlesungen + ${taskHrsStr} Std. bearbeitete Aufgaben)
-                  </div>
-                </div>
-              </div>
-            </div>
-          `;
-        }).join('')}
-      </div>
-
-      <form id="add-subject-form" class="form-grid" style="align-items:end;padding-top:12px;border-top:1px solid var(--ln)">
+      <form id="add-subject-form" class="form-grid" style="align-items:end;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--ln)">
         <div>
-          <label>Weiteres Fach hinzufügen</label>
-          <input type="text" name="name" placeholder="z. B. Thermodynamik" required>
+          <label>Fach hinzufügen</label>
+          <input type="text" name="name" placeholder="Fachname" required>
         </div>
         <div>
           <label>Credit Points (CP)</label>
-          <input type="number" name="cp" value="5" min="1" max="30" step="0.5">
+          <input type="number" name="cp" value="6" min="1" max="30" step="0.5">
         </div>
         <div style="display:flex;gap:8px;align-items:flex-end">
           <div>
             <label>Farbe</label>
-            <input type="color" name="color" value="#14b8a6" style="width:42px;height:36px;padding:2px;border-radius:8px;border:1px solid var(--ln)">
+            <input type="color" name="color" value="#3b82f6" style="width:42px;height:36px;padding:2px;border-radius:8px;border:1px solid var(--ln)">
           </div>
           <button type="submit" class="btn btn-primary" style="flex:1">+ Fach anlegen</button>
         </div>
       </form>
+
+      ${sortedSubjects.length === 0 ? `<div class="empty-box">Noch keine Fächer eingetragen. Füge oben deine Fächer hinzu.</div>` : `
+        <div class="task-list">
+          ${sortedSubjects.map((s, idx) => {
+            const acc = computeSubjectHoursAccount(s, S);
+            const workedStr = formatHoursDecimal(acc.totalMinutes);
+            const taskHrsStr = formatHoursDecimal(acc.taskMinutes);
+            const lecHrsStr = formatHoursDecimal(acc.lectureMinutes);
+            const statusColor = acc.isGoalMet ? 'var(--ok)' : 'var(--rd)';
+            const statusBg = acc.isGoalMet ? 'var(--ok-soft)' : 'var(--rd-soft)';
+
+            return `
+              <div class="subj-item" style="--sc:${s.color};flex-direction:column;align-items:stretch;gap:10px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+                  <div style="display:flex;align-items:center;gap:10px">
+                    <span class="badge" style="background:${s.color};color:#fff;border:none;font-weight:700">#${idx + 1}</span>
+                    <input type="color" value="${s.color}" data-action="subj-color" data-id="${s.id}" style="width:26px;height:26px;border:0;padding:0;background:none;cursor:pointer">
+                    <b style="font-size:15.5px">${esc(s.name)}</b>
+                  </div>
+
+                  <div style="display:flex;align-items:center;gap:6px">
+                    <button class="btn btn-sm" data-action="subj-up" data-id="${s.id}" ${idx === 0 ? 'disabled' : ''}>↑ Höher</button>
+                    <button class="btn btn-sm" data-action="subj-down" data-id="${s.id}" ${idx === sortedSubjects.length - 1 ? 'disabled' : ''}>↓ Tiefer</button>
+                    <button class="btn btn-sm btn-danger" data-action="subj-del" data-id="${s.id}" title="Fach löschen">🗑</button>
+                  </div>
+                </div>
+
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--ln)">
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <label style="margin:0;font-size:12.5px">Credit Points (CP):</label>
+                    <input type="number" value="${acc.cp}" min="1" max="30" step="0.5"
+                           data-action="subj-cp" data-id="${s.id}"
+                           style="width:74px;padding:4px 8px;font-size:13px;font-weight:700">
+                  </div>
+
+                  <div style="text-align:right">
+                    <span style="display:inline-block;padding:5px 12px;border-radius:8px;font-weight:800;font-size:14px;color:${statusColor};background:${statusBg};border:1px solid ${statusColor}">
+                      Stunden: ${workedStr}/${acc.requiredHours}
+                    </span>
+                    <div style="font-size:11.5px;color:var(--mu);margin-top:3px">
+                      (${lecHrsStr} Std. besuchte Vorlesungen + ${taskHrsStr} Std. bearbeitete Aufgaben)
+                    </div>
+                  </div>
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      `}
     </section>
   `;
 }
 
-/* --- TAB 4: Bonuspunkte-Tests, Wochen-Abgaben (MG) & Klausuren --- */
+/* --- TAB 4: Bonuspunkte-Tests, Wochen-Abgaben & Klausuren --- */
 
-function renderTestsView(plan) {
+function renderTestsView() {
   const todayStr = toDateStr(new Date());
   const sortedTests = [...S.tests].sort((a, b) => a.date.localeCompare(b.date));
 
@@ -951,86 +1064,84 @@ function renderTestsView(plan) {
         <div class="panel-head">
           <h2>🎯 Test, Wochen-Abgabe oder Klausur eintragen</h2>
         </div>
-        <p style="font-size:13px;color:var(--mu);margin-top:0">
-          1) Für z. B. <b>MG Bonuspunkte-Abgaben mit 1 Woche Zeit</b> wähle <i>„Bonuspunkte-Abgabe / Wochenaufgabe“</i> und gib den Arbeitsaufwand direkt in <b>Stunden</b> an.<br>
-          2) <b>Klausuren in 3–4 Monaten</b> bleiben automatisch so lange im Hintergrund pausiert, bis das eingestellte Vorbereitungs-Fenster (z. B. 14 Tage vor der Klausur) erreicht ist!
-        </p>
-        <form id="add-test-form" class="form-stack">
-          <div class="form-grid">
-            <div>
-              <label>Art der Prüfung / Abgabe</label>
-              <select name="type" id="test-type-sel">
-                <option value="bonus">Bonuspunkte-Test (feste Prüfungszeit)</option>
-                <option value="bonus_submission">Bonuspunkte-Abgabe / Wochenaufgabe (z. B. MG – 1 Woche Zeit)</option>
-                <option value="exam">Klausur (Semesterende)</option>
-              </select>
+        ${S.subjects.length === 0 ? `
+          <div class="empty-box">Bitte lege zuerst unter <b>„🏆 Fächer & CP“</b> deine Fächer an.</div>
+        ` : `
+          <form id="add-test-form" class="form-stack">
+            <div class="form-grid">
+              <div>
+                <label>Art der Prüfung / Abgabe</label>
+                <select name="type" id="test-type-sel">
+                  <option value="bonus">Bonuspunkte-Test (feste Prüfungszeit)</option>
+                  <option value="bonus_submission">Bonuspunkte-Abgabe / Wochenaufgabe (Frist)</option>
+                  <option value="exam">Klausur</option>
+                </select>
+              </div>
+              <div>
+                <label>Fach</label>
+                <select name="subjectId">
+                  ${S.subjects.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}
+                </select>
+              </div>
             </div>
-            <div>
-              <label>Fach</label>
-              <select name="subjectId">
-                ${S.subjects.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}
-              </select>
-            </div>
-          </div>
 
-          <div>
-            <label>Bezeichnung</label>
-            <input type="text" name="title" placeholder="z. B. MG Bonustest 1 (Konstruktionsabgabe) / Klausur Mechanik" required>
-          </div>
+            <div>
+              <label>Bezeichnung</label>
+              <input type="text" name="title" placeholder="Bezeichnung" required>
+            </div>
 
-          <div class="form-grid">
-            <div>
-              <label>Datum (Prüfungstag bzw. Abgabefrist)</label>
-              <input type="date" name="date" value="${addDays(todayStr, 7)}" required>
+            <div class="form-grid">
+              <div>
+                <label>Datum (Prüfungstag bzw. Abgabefrist)</label>
+                <input type="date" name="date" value="${addDays(todayStr, 7)}" required>
+              </div>
+              <div>
+                <label>Uhrzeit (Beginn bzw. Abgabeschluss)</label>
+                <input type="time" name="start" value="10:00" required>
+              </div>
+              <div id="test-dur-wrap">
+                <label>Prüfungsdauer vor Ort (Min.)</label>
+                <input type="number" name="durationMin" value="45" min="0" max="600" step="5">
+              </div>
             </div>
-            <div>
-              <label>Uhrzeit (Beginn bzw. Abgabeschluss)</label>
-              <input type="time" name="start" value="10:00" required>
-            </div>
-            <div id="test-dur-wrap">
-              <label>Prüfungsdauer vor Ort (Min.)</label>
-              <input type="number" name="durationMin" value="45" min="0" max="600" step="5">
-            </div>
-          </div>
 
-          <div class="form-grid">
-            <div>
-              <label>Relevanz (1 = gering, 5 = extrem wichtig)</label>
-              <select name="relevance">
-                <option value="1">1 – Geringer Bonus</option>
-                <option value="2">2 – Nebensächlich</option>
-                <option value="3" selected>3 – Normal wichtig</option>
-                <option value="4">4 – Wichtig (viele Punkte)</option>
-                <option value="5">5 – Extrem hohe Relevanz / Bestehensrelevant</option>
-              </select>
+            <div class="form-grid">
+              <div>
+                <label>Relevanz (1 = gering, 5 = extrem wichtig)</label>
+                <select name="relevance">
+                  <option value="1">1 – Gering</option>
+                  <option value="2">2 – Eher gering</option>
+                  <option value="3" selected>3 – Mittel</option>
+                  <option value="4">4 – Wichtig</option>
+                  <option value="5">5 – Sehr wichtig</option>
+                </select>
+              </div>
+              <div>
+                <label>Schwierigkeit (1 = leicht, 5 = sehr schwer)</label>
+                <select name="difficulty">
+                  <option value="1">1 – Sehr leicht</option>
+                  <option value="2">2 – Eher leicht</option>
+                  <option value="3" selected>3 – Mittel</option>
+                  <option value="4">4 – Schwer</option>
+                  <option value="5">5 – Sehr schwer</option>
+                </select>
+              </div>
             </div>
-            <div>
-              <label>Schwierigkeit (1 = leicht, 5 = sehr schwer)</label>
-              <select name="difficulty">
-                <option value="1">1 – Sehr leicht</option>
-                <option value="2">2 – Eher leicht</option>
-                <option value="3" selected>3 – Mittel</option>
-                <option value="4">4 – Anspruchsvoll / Schwer</option>
-                <option value="5">5 – Sehr schwer (intensives Training nötig)</option>
-              </select>
-            </div>
-          </div>
 
-          <div class="form-grid">
-            <div>
-              <label>Arbeits-/Vorbereitungsaufwand in STUNDEN (z. B. 8 oder 15,5 Std.)</label>
-              <input type="number" name="prepHours" value="3" min="0" max="300" step="0.5">
-              <span style="font-size:11.5px;color:var(--mu)">Legt automatisch eine Aufgabe mit dieser Stundenzahl an (0 = keine Aufgabe anlegen).</span>
+            <div class="form-grid">
+              <div>
+                <label>Arbeits-/Vorbereitungsaufwand in STUNDEN</label>
+                <input type="number" name="prepHours" value="3" min="0" max="300" step="0.5">
+              </div>
+              <div>
+                <label>Frühestens im Plan starten (Tage vorher)</label>
+                <input type="number" name="leadDays" id="test-leaddays-inp" value="7" min="1" max="120" step="1">
+              </div>
             </div>
-            <div>
-              <label>Frühestens im Plan starten (Tage vorher)</label>
-              <input type="number" name="leadDays" id="test-leaddays-inp" value="7" min="1" max="120" step="1">
-              <span style="font-size:11.5px;color:var(--mu)">Vorher wird der Plan noch NICHT durch diese Prüfung blockiert! (Standard: 7 Tage bei Bonus/Abgabe, 14 Tage bei Klausur).</span>
-            </div>
-          </div>
 
-          <button type="submit" class="btn btn-primary">Prüfung / Abgabe speichern & Plan berechnen</button>
-        </form>
+            <button type="submit" class="btn btn-primary">Prüfung / Abgabe speichern & Plan berechnen</button>
+          </form>
+        `}
       </section>
 
       <section class="panel">
@@ -1071,7 +1182,7 @@ function renderTestsView(plan) {
                   <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:4px;font-size:12px">
                     <div>
                       ${isWaiting
-                        ? `<span style="color:var(--mu)">⏸ Noch weit weg: Vorbereitung & Boost starten erst <b>${leadDays} Tage vorher</b> (ab ${formatDateNice(startPrepDate)})</span>`
+                        ? `<span style="color:var(--mu)">⏸ Startet erst <b>${leadDays} Tage vorher</b> (ab ${formatDateNice(startPrepDate)})</span>`
                         : `<span style="color:var(--ok);font-weight:600">🔥 Aktiv im Planungsfenster (≤ ${leadDays} Tage vor Termin)</span>`
                       }
                     </div>
@@ -1100,49 +1211,49 @@ function renderScheduleView() {
 
   return `
     <div class="two-col">
-      <!-- Wiederkehrende Vorlesungen -->
       <section class="panel">
         <div class="panel-head">
           <h2>🏛️ Wöchentliche Vorlesungen & Übungen</h2>
         </div>
-        <p style="font-size:13px;color:var(--mu);margin-top:0">
-          Vor und nach jeder Vorlesung hält der Planer automatisch <b>${S.settings.transitBufferMin} Min. Wegezeit</b> für den Gebäudewechsel frei. Im 10-Tage-Plan kannst du jede Vorlesung als <b>„✓ Besucht“</b> markieren (zählt auf das Stundenkonto des Fachs) oder für die aktuelle Woche mit <b>„🚫 Gehe ich nicht hin“</b> freigeben!
-        </p>
-        <form id="add-lecture-form" class="form-stack" style="margin-bottom:18px">
-          <div class="form-grid">
-            <div>
-              <label>Zugehöriges Fach (für Stundenkonto)</label>
-              <select name="subjectId">
-                ${S.subjects.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}
-              </select>
+        ${S.subjects.length === 0 ? `
+          <div class="empty-box">Bitte lege zuerst unter <b>„🏆 Fächer & CP“</b> deine Fächer an.</div>
+        ` : `
+          <form id="add-lecture-form" class="form-stack" style="margin-bottom:18px">
+            <div class="form-grid">
+              <div>
+                <label>Zugehöriges Fach</label>
+                <select name="subjectId">
+                  ${S.subjects.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label>Bezeichnung</label>
+                <input type="text" name="title" placeholder="Bezeichnung" required>
+              </div>
             </div>
-            <div>
-              <label>Bezeichnung</label>
-              <input type="text" name="title" placeholder="z. B. Mechanik Vorlesung / Übung" required>
+            <div class="form-grid">
+              <div>
+                <label>Wochentag</label>
+                <select name="weekday">
+                  ${[1, 2, 3, 4, 5, 6].map(w => `<option value="${w}">${WEEKDAY_NAMES[w]}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label>Startzeit</label>
+                <input type="time" name="start" value="09:45" required>
+              </div>
+              <div>
+                <label>Endzeit</label>
+                <input type="time" name="end" value="11:15" required>
+              </div>
+              <div>
+                <label>Raum / Gebäude (optional)</label>
+                <input type="text" name="room" placeholder="Raum">
+              </div>
             </div>
-          </div>
-          <div class="form-grid">
-            <div>
-              <label>Wochentag</label>
-              <select name="weekday">
-                ${[1, 2, 3, 4, 5, 6].map(w => `<option value="${w}">${WEEKDAY_NAMES[w]}</option>`).join('')}
-              </select>
-            </div>
-            <div>
-              <label>Startzeit</label>
-              <input type="time" name="start" value="09:45" required>
-            </div>
-            <div>
-              <label>Endzeit</label>
-              <input type="time" name="end" value="11:15" required>
-            </div>
-            <div>
-              <label>Gebäude / Hörsaal (optional)</label>
-              <input type="text" name="room" placeholder="z. B. Audimax / Geb. 10">
-            </div>
-          </div>
-          <button type="submit" class="btn btn-primary">+ Vorlesung zum Stundenplan hinzufügen</button>
-        </form>
+            <button type="submit" class="btn btn-primary">+ Vorlesung hinzufügen</button>
+          </form>
+        `}
 
         <div class="task-list">
           ${sortedLectures.length === 0 ? `<div class="empty-box">Noch keine Vorlesungen eingetragen.</div>` : sortedLectures.map(l => {
@@ -1168,18 +1279,14 @@ function renderScheduleView() {
         </div>
       </section>
 
-      <!-- Außer-Haus-Termine & Urlaub -->
       <section class="panel">
         <div class="panel-head">
           <h2>🏖️ Außer-Haus-Termine, Freizeit & Urlaub</h2>
         </div>
-        <p style="font-size:13px;color:var(--mu);margin-top:0">
-          Trage hier private Termine (Sport, Treffen, Arzt, Arbeit) oder mehrtägigen Urlaub ein. In diese Zeiten legt der Algorithmus garantiert keine Aufgaben.
-        </p>
         <form id="add-event-form" class="form-stack" style="margin-bottom:18px">
           <div>
-            <label>Was steht an?</label>
-            <input type="text" name="title" placeholder="z. B. Training / Geburtstag / Wochenend-Trip" required>
+            <label>Bezeichnung</label>
+            <input type="text" name="title" placeholder="Termin" required>
           </div>
           <div class="form-grid">
             <div>
@@ -1187,13 +1294,13 @@ function renderScheduleView() {
               <input type="date" name="startDate" value="${toDateStr(new Date())}" required>
             </div>
             <div>
-              <label>Bis Datum (bei Urlaub)</label>
+              <label>Bis Datum</label>
               <input type="date" name="endDate" value="${toDateStr(new Date())}">
             </div>
           </div>
           <div style="display:flex;align-items:center;gap:8px;margin:2px 0">
             <input type="checkbox" id="ev-allday-chk" name="allDay" style="width:17px;height:17px">
-            <label for="ev-allday-chk" style="margin:0;cursor:pointer;color:var(--tx)">Ganztägig (z. B. Urlaub / den ganzen Tag unterwegs)</label>
+            <label for="ev-allday-chk" style="margin:0;cursor:pointer;color:var(--tx)">Ganztägig</label>
           </div>
           <div class="form-grid" id="ev-time-row">
             <div>
@@ -1209,7 +1316,7 @@ function renderScheduleView() {
         </form>
 
         <div class="task-list">
-          ${sortedEvents.length === 0 ? `<div class="empty-box">Noch keine Außer-Haus-Termine oder Urlaube eingetragen.</div>` : sortedEvents.map(ev => `
+          ${sortedEvents.length === 0 ? `<div class="empty-box">Noch keine Außer-Haus-Termine eingetragen.</div>` : sortedEvents.map(ev => `
             <div class="subj-item" style="--sc:var(--purple)">
               <div>
                 <b>${esc(ev.title)}</b><br>
@@ -1227,11 +1334,10 @@ function renderScheduleView() {
   `;
 }
 
-/* --- TAB 6: Pausen, CP-Faktor, Account & Cloud-Sync --- */
+/* --- TAB 6: Pausen, CP-Faktor & Account-Speicher --- */
 
 function renderSettingsView() {
   const st = S.settings;
-  const cloudUrl = getCloudBaseUrl();
 
   return `
     <div class="two-col">
@@ -1316,51 +1422,35 @@ function renderSettingsView() {
       </section>
 
       <div style="display:flex;flex-direction:column;gap:18px">
-        <!-- Account & Cloud-Sync -->
         <section class="panel">
           <div class="panel-head">
-            <h2>👤 Account & Multi-Geräte Cloud-Sync</h2>
-            <button class="btn btn-sm btn-danger" data-action="logout">Abmelden / Nutzer wechseln</button>
+            <h2>🔐 Benutzerkonto & Passwort-Speicher</h2>
+            <button class="btn btn-sm btn-danger" data-action="logout">Abmelden</button>
           </div>
           <p style="font-size:13px;color:var(--mu);margin-top:0">
-            Aktuell eingeloggt als: <b>${esc(SESSION.username)}</b>.<br>
-            Damit du von <b>Mac & Handy</b> auf denselben Stand zugreifst (auch über GitHub Pages <code>iann479.github.io</code>, ohne eigenen Server zuhause!), kannst du hier eine kostenlose <b>Firebase Realtime Database URL</b> eintragen:
+            Eingeloggt als: <b>${esc(SESSION.username)}</b><br>
+            Dein Passwort wird niemals im Klartext gespeichert, sondern als <b>SHA-256 Hash</b> (<code>${esc(SESSION.passHash.slice(0, 16))}…</code>).
+            Dadurch kann die Datei <code>users.json</code> bedenkenlos öffentlich im Repository liegen.
           </p>
-          <form id="cloud-sync-form" class="form-stack">
-            <div>
-              <label>Firebase Realtime Database URL</label>
-              <input type="url" name="cloudUrl" value="${esc(cloudUrl)}" placeholder="https://dein-projekt-default-rtdb.europe-west1.firebasedatabase.app">
-            </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button type="submit" class="btn btn-primary">☁️ Cloud-URL speichern & synchronisieren</button>
-              ${cloudUrl ? `<button type="button" class="btn" data-action="cloud-pull-now">📥 Jetzt aus Cloud laden</button>` : ''}
-            </div>
-          </form>
 
-          <hr style="border:0;border-top:1px solid var(--ln);margin:16px 0">
-
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn btn-sm" data-action="export-json">💾 Plan als Datei exportieren (Backup)</button>
-            <label class="btn btn-sm" style="margin:0;cursor:pointer">
-              📂 Backup-Datei importieren
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+            <button class="btn btn-primary" data-action="export-users-json">
+              🔑 users.json herunterladen (SHA-256 Account-Datei)
+            </button>
+            <button class="btn" data-action="export-json">
+              💾 Eigenen Plan exportieren
+            </button>
+            <label class="btn" style="margin:0;cursor:pointer">
+              📂 Plan importieren
               <input type="file" id="import-json-inp" accept=".json" style="display:none">
             </label>
           </div>
-        </section>
 
-        <!-- Demo & Reset -->
-        <section class="panel">
-          <div class="panel-head">
-            <h2>🧪 Demo-Szenario & Zurücksetzen</h2>
-          </div>
-          <div style="display:flex;flex-direction:column;gap:10px">
-            <button class="btn btn-primary" data-action="load-demo">
-              🚀 Beispiel-Stundenplan & Montags-Bonustest in Mathe laden
-            </button>
-            <button class="btn btn-danger" data-action="reset-all">
-              🗑 Alle Daten dieses Accounts zurücksetzen
-            </button>
-          </div>
+          <hr style="border:0;border-top:1px solid var(--ln);margin:16px 0">
+
+          <button class="btn btn-danger" data-action="reset-all" style="width:100%">
+            🗑 Alle Daten dieses Accounts zurücksetzen
+          </button>
         </section>
       </div>
     </div>
@@ -1380,12 +1470,12 @@ function renderProgressModal() {
         <h3>⏱ Fortschritt & Restzeit verbuchen</h3>
         <p style="font-size:13.5px;color:var(--mu);margin-top:0">
           Aufgabe: <b>${esc(t.title)}</b> (${esc(subj.name)})<br>
-          Bisher für diese Aufgabe verbucht: <b>${formatDuration(t.workedMinutes || 0)}</b> · Aktuell noch offen: <b>${formatDuration(t.remainingMinutes)}</b>
+          Bisher verbucht: <b>${formatDuration(t.workedMinutes || 0)}</b> · Aktuell noch offen: <b>${formatDuration(t.remainingMinutes)}</b>
         </p>
 
         <form id="progress-modal-form" class="form-stack">
           <div>
-            <label>Wie viele Minuten hast du gerade an dieser Aufgabe gearbeitet? (wird dem Fach gutgeschrieben)</label>
+            <label>Wie viele Minuten hast du gerade gearbeitet? (wird dem Fach gutgeschrieben)</label>
             <input type="number" name="justWorkedMinutes" id="modal-worked-inp" value="0" min="0" max="600" step="5">
           </div>
 
@@ -1411,88 +1501,6 @@ function renderProgressModal() {
   `;
 }
 
-/* --- Demo-Daten Generator --- */
-
-function loadDemoScenario() {
-  const todayStr = toDateStr(new Date());
-  let daysToMon = (8 - getWeekdayIso(todayStr)) % 7;
-  if (daysToMon < 2) daysToMon += 7;
-  const nextMondayStr = addDays(todayStr, daysToMon);
-
-  S.subjects = JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
-  S.lectureStatus = {};
-
-  S.lectures = [
-    { id: uid(), subjectId: 'subj_mech',  title: 'Mechanik Vorlesung', weekday: 1, start: '08:30', end: '10:00', room: 'Hörsaal H1' },
-    { id: uid(), subjectId: 'subj_mathe', title: 'Mathe Vorlesung',    weekday: 1, start: '12:00', end: '13:30', room: 'Audimax' },
-    { id: uid(), subjectId: 'subj_num',   title: 'Numerik Vorlesung',  weekday: 2, start: '10:00', end: '11:30', room: 'Geb. 20' },
-    { id: uid(), subjectId: 'subj_werk',  title: 'Werkstoffkunde',     weekday: 3, start: '09:00', end: '10:30', room: 'Hörsaal W' },
-    { id: uid(), subjectId: 'subj_mg2',   title: 'MG2 Übung',          weekday: 4, start: '14:00', end: '15:30', room: 'Zeichensaal' },
-    { id: uid(), subjectId: 'subj_mech',  title: 'Mechanik Übung',     weekday: 5, start: '10:00', end: '11:30', room: 'Hörsaal H2' }
-  ];
-
-  S.events = [
-    { id: uid(), title: 'Sport / Training (Außer-Haus)', startDate: addDays(todayStr, 1), endDate: addDays(todayStr, 1), allDay: false, start: '17:30', end: '19:30' }
-  ];
-
-  const testIdMathe = uid();
-  const testIdMgWeek = uid();
-  const testIdFarExam = uid();
-
-  S.tests = [
-    {
-      id: testIdMathe,
-      type: 'bonus',
-      subjectId: 'subj_mathe',
-      title: 'Bonuspunkte-Test Mathe',
-      date: nextMondayStr,
-      start: '10:15',
-      durationMin: 45,
-      relevance: 4,
-      difficulty: 4,
-      leadDays: 7
-    },
-    {
-      id: testIdMgWeek,
-      type: 'bonus_submission',
-      subjectId: 'subj_mg2',
-      title: 'MG2 Bonustest-Abgabe (1 Woche Zeit)',
-      date: addDays(todayStr, 6),
-      start: '18:00',
-      durationMin: 0,
-      relevance: 4,
-      difficulty: 3,
-      leadDays: 7
-    },
-    {
-      id: testIdFarExam,
-      type: 'exam',
-      subjectId: 'subj_mech',
-      title: 'Klausur Mechanik (Semesterende)',
-      date: addDays(todayStr, 95),
-      start: '09:00',
-      durationMin: 120,
-      relevance: 5,
-      difficulty: 5,
-      leadDays: 14
-    }
-  ];
-
-  S.tasks = [
-    { id: uid(), title: 'Mechanik: Freischnitt-Übungsblatt 3', subjectId: 'subj_mech', relevance: 4, totalMinutes: 90, remainingMinutes: 90, workedMinutes: 0, due: '', testId: '', done: false },
-    { id: uid(), title: 'Mechanik: Digitalwerkstatt (nicht klausurrelevant)', subjectId: 'subj_mech', relevance: 1, totalMinutes: 60, remainingMinutes: 60, workedMinutes: 0, due: '', testId: '', done: false },
-    { id: uid(), title: 'Numerik: Programmieraufgabe Gauß-Verfahren', subjectId: 'subj_num', relevance: 3, totalMinutes: 120, remainingMinutes: 120, workedMinutes: 0, due: '', testId: '', done: false },
-    { id: uid(), title: 'Mathe: Alttests & Übungsaufgaben für Bonustest rechnen', subjectId: 'subj_mathe', relevance: 5, totalMinutes: 150, remainingMinutes: 150, workedMinutes: 0, due: nextMondayStr, testId: testIdMathe, isTestPrep: true, done: false },
-    { id: uid(), title: 'Bearbeitung: MG2 Bonustest-Abgabe (1 Woche Zeit)', subjectId: 'subj_mg2', relevance: 4, totalMinutes: 240, remainingMinutes: 240, workedMinutes: 0, due: addDays(todayStr, 6), testId: testIdMgWeek, isTestPrep: true, done: false },
-    { id: uid(), title: 'Vorbereitung: Klausur Mechanik (Semesterende)', subjectId: 'subj_mech', relevance: 5, totalMinutes: 900, remainingMinutes: 900, workedMinutes: 0, due: addDays(todayStr, 95), testId: testIdFarExam, isTestPrep: true, done: false }
-  ];
-
-  saveState();
-  UI.tab = 'plan';
-  render();
-  showToast('Demo geladen!');
-}
-
 /* --- Event-Listener --- */
 
 document.addEventListener('click', e => {
@@ -1502,6 +1510,13 @@ document.addEventListener('click', e => {
 
   if (action === 'toggle-theme') {
     toggleTheme();
+    return;
+  }
+
+  if (action === 'switch-auth-mode') {
+    UI.authMode = btn.dataset.mode;
+    UI.authError = '';
+    render();
     return;
   }
 
@@ -1521,13 +1536,20 @@ document.addEventListener('click', e => {
     localStorage.removeItem(AUTH_SESSION_KEY);
     SESSION = null;
     UI.mobileMenuOpen = false;
+    UI.authError = '';
     render();
     showToast('Abgemeldet.');
     return;
   }
 
-  if (action === 'cloud-pull-now') {
-    pullFromCloudIfConfigured(true);
+  if (action === 'export-users-json') {
+    const reg = getLocalUsersRegistry();
+    const blob = new Blob([JSON.stringify({ users: reg }, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'users.json';
+    a.click();
+    showToast('users.json (mit SHA-256 Passwort-Hashes) heruntergeladen.');
     return;
   }
 
@@ -1537,7 +1559,7 @@ document.addEventListener('click', e => {
     a.href = URL.createObjectURL(blob);
     a.download = `uni-planer-${SESSION?.username || 'backup'}-${toDateStr(new Date())}.json`;
     a.click();
-    showToast('Backup-Datei heruntergeladen.');
+    showToast('Plan-Datei heruntergeladen.');
     return;
   }
 
@@ -1767,6 +1789,19 @@ document.addEventListener('click', e => {
     return;
   }
 
+  if (action === 'subj-del') {
+    const id = btn.dataset.id;
+    S.subjects = S.subjects.filter(s => s.id !== id);
+    S.subjects.sort((a, b) => a.baseRank - b.baseRank).forEach((s, i) => { s.baseRank = i + 1; });
+    S.tasks = S.tasks.filter(t => t.subjectId !== id);
+    S.tests = S.tests.filter(t => t.subjectId !== id);
+    S.lectures = S.lectures.filter(l => l.subjectId !== id);
+    saveState();
+    render();
+    showToast('Fach gelöscht.');
+    return;
+  }
+
   if (action === 'test-del') {
     const testId = btn.dataset.id;
     S.tests = S.tests.filter(x => x.id !== testId);
@@ -1793,13 +1828,8 @@ document.addEventListener('click', e => {
     return;
   }
 
-  if (action === 'load-demo') {
-    loadDemoScenario();
-    return;
-  }
-
   if (action === 'reset-all') {
-    if (confirm('Wirklich alle Aufgaben, Tests und Termine dieses Accounts zurücksetzen?')) {
+    if (confirm('Wirklich alle Daten dieses Accounts zurücksetzen?')) {
       S = normalizeStateObject(null);
       saveState();
       render();
@@ -1875,7 +1905,7 @@ document.addEventListener('change', e => {
         S = normalizeStateObject(parsed);
         saveState();
         render();
-        showToast('Backup erfolgreich importiert!');
+        showToast('Plan erfolgreich importiert!');
       } catch (err) {
         showToast('Ungültige JSON-Datei.');
       }
@@ -1884,55 +1914,77 @@ document.addEventListener('change', e => {
   }
 });
 
-document.addEventListener('submit', e => {
+document.addEventListener('submit', async e => {
   e.preventDefault();
   const form = e.target;
 
-  if (form.id === 'login-form') {
+  if (form.id === 'auth-form') {
     const f = form.elements;
     const username = f.username.value.trim();
     const password = f.password.value;
-    const cloudUrl = (f.cloudUrl?.value || '').trim();
-    if (!username) return;
+    if (!username || !password) return;
 
-    if (cloudUrl) {
-      localStorage.setItem(CLOUD_URL_KEY, cloudUrl);
-    }
+    const uKey = cleanUsername(username);
+    const passHash = await computePasswordHash(username, password);
+    const reg = getLocalUsersRegistry();
+    const existingLocal = reg[uKey];
 
-    SESSION = {
-      username,
-      passHash: simpleHash(password),
-      cloudUrl: cloudUrl || localStorage.getItem(CLOUD_URL_KEY) || ''
-    };
-    localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
-    S = loadStateForCurrentUser();
-    render();
-    showToast(`Willkommen, ${username}!`);
-    if (getCloudBaseUrl()) {
-      pullFromCloudIfConfigured(true);
-    }
-    return;
-  }
+    UI.authError = '';
 
-  if (form.id === 'cloud-sync-form') {
-    const url = form.elements.cloudUrl.value.trim();
-    localStorage.setItem(CLOUD_URL_KEY, url);
-    if (SESSION) {
-      SESSION.cloudUrl = url;
+    // 1. Falls Netlify Backend aktiv ist, prüfe / registriere direkt auf dem Server
+    if (UI.netlifyAvailable) {
+      SESSION = { username, passHash };
+      const resp = await syncWithNetlify(UI.authMode === 'register' ? 'register' : 'login');
+      if (!resp || !resp.ok) {
+        SESSION = null;
+        UI.authError = resp?.error || 'Anmeldung fehlgeschlagen.';
+        render();
+        return;
+      }
       localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
-    }
-    if (url) {
-      pullFromCloudIfConfigured(true);
-    } else {
-      UI.cloudStatusMsg = '';
+      S = resp.data?.state ? normalizeStateObject(resp.data.state) : loadStateForCurrentUser();
+      saveState(true);
       render();
-      showToast('Cloud-Sync deaktiviert (nur lokale Speicherung).');
+      showToast(`Angemeldet als ${username}`);
+      return;
+    }
+
+    // 2. Lokale / users.json Prüfung (mit SHA-256 Passwort-Hash)
+    if (UI.authMode === 'register') {
+      if (existingLocal && existingLocal.passHash && existingLocal.passHash !== passHash) {
+        UI.authError = 'Dieser Benutzername ist bereits vergeben.';
+        render();
+        return;
+      }
+      SESSION = { username, passHash };
+      localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
+      S = loadStateForCurrentUser();
+      saveState();
+      render();
+      showToast(`Konto „${username}“ erstellt!`);
+    } else {
+      if (!existingLocal) {
+        UI.authError = 'Benutzerkonto nicht gefunden. Bitte wechsle oben auf „➕ Registrieren“, um es neu anzulegen.';
+        render();
+        return;
+      }
+      if (existingLocal.passHash !== passHash) {
+        UI.authError = 'Falsches Passwort für diesen Benutzernamen.';
+        render();
+        return;
+      }
+      SESSION = { username, passHash };
+      localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
+      S = loadStateForCurrentUser();
+      render();
+      showToast(`Willkommen zurück, ${username}!`);
     }
     return;
   }
 
   if (form.id === 'quick-task-form') {
     const f = form.elements;
+    if (!f.subjectId || !f.subjectId.value) return;
     const min = Math.max(5, Number(f.minutes.value) || 60);
     const rel = Number(f.relevance.value) || 3;
     const newTask = {
@@ -1953,7 +2005,7 @@ document.addEventListener('submit', e => {
     S.tasks.push(newTask);
     saveState();
     render();
-    showToast(`Aufgabe „${newTask.title}“ (Rel ${rel}/5) eingeplant!`);
+    showToast(`Aufgabe „${newTask.title}“ eingeplant!`);
     return;
   }
 
@@ -1964,8 +2016,8 @@ document.addEventListener('submit', e => {
     S.subjects.push({
       id: 'subj_' + uid(),
       name,
-      color: f.color.value || '#14b8a6',
-      cp: Number(f.cp.value) || 5,
+      color: f.color.value || '#3b82f6',
+      cp: Number(f.cp.value) || 6,
       baseRank: S.subjects.length + 1
     });
     saveState();
@@ -1976,6 +2028,7 @@ document.addEventListener('submit', e => {
 
   if (form.id === 'add-test-form') {
     const f = form.elements;
+    if (!f.subjectId || !f.subjectId.value) return;
     const testId = uid();
     const title = f.title.value.trim();
     const prepHours = Math.max(0, Number(f.prepHours.value) || 0);
@@ -2022,6 +2075,7 @@ document.addEventListener('submit', e => {
 
   if (form.id === 'add-lecture-form') {
     const f = form.elements;
+    if (!f.subjectId || !f.subjectId.value) return;
     S.lectures.push({
       id: uid(),
       subjectId: f.subjectId.value,
@@ -2098,8 +2152,5 @@ document.addEventListener('submit', e => {
   }
 });
 
-// Initialer Start (+ Cloud-Pull falls eingeloggt)
+// Initialer Start
 render();
-if (SESSION && getCloudBaseUrl()) {
-  pullFromCloudIfConfigured(false);
-}

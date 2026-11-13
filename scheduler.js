@@ -2,14 +2,7 @@
    scheduler.js – Dynamischer Prioritäts-, Stundenkonto- & Zeitplan-Algorithmus
    ========================================================================== */
 
-const DEFAULT_SUBJECTS = [
-  { id: 'subj_mech',  name: 'Mechanik',         color: '#3b82f6', baseRank: 1, cp: 6 },
-  { id: 'subj_num',   name: 'Numerik',          color: '#8b5cf6', baseRank: 2, cp: 6 },
-  { id: 'subj_werk',  name: 'Werkstoffkunde',   color: '#f59e0b', baseRank: 3, cp: 5 },
-  { id: 'subj_mathe', name: 'Mathe',            color: '#10b981', baseRank: 4, cp: 6 },
-  { id: 'subj_mg2',   name: 'MG2',              color: '#ec4899', baseRank: 5, cp: 5 },
-  { id: 'subj_mgii',  name: 'MGII',             color: '#06b6d4', baseRank: 6, cp: 5 }
-];
+const DEFAULT_SUBJECTS = [];
 
 const DEFAULT_SETTINGS = {
   horizonDays: 10,          // 10 Tage (~1,5 Wochen)
@@ -52,7 +45,6 @@ function daysBetween(d1Str, d2Str) {
 }
 
 function getWeekdayIso(dateStr) {
-  // 1 = Montag ... 7 = Sonntag
   const d = new Date(dateStr + 'T12:00:00').getDay();
   return d === 0 ? 7 : d;
 }
@@ -91,20 +83,11 @@ function formatHoursDecimal(min) {
 
 /* --- Stundenkonto-Berechnung pro Fach (Besuchte Vorlesungen + Bearbeitete Aufgaben) --- */
 
-/**
- * Berechnet für ein Fach:
- * - `taskMinutes`: Alle bearbeiteten Minuten aus Aufgaben (fertige + teilweise bearbeitete)
- * - `lectureMinutes`: Alle Minuten aus als "besucht" markierten Vorlesungen
- * - `totalMinutes`: Summe in Minuten
- * - `workedHours`: Summe in Stunden (auf 1 Nachkommastelle)
- * - `requiredHours`: CP * hoursPerCp
- */
 function computeSubjectHoursAccount(subject, state) {
   const hoursPerCp = Number(state.settings?.hoursPerCp) || 30;
   const cp = Number(subject.cp) ?? 6;
   const requiredHours = cp * hoursPerCp;
 
-  // 1. Bearbeitete Aufgaben-Zeit summieren
   let taskMinutes = 0;
   for (const t of (state.tasks || [])) {
     if (t.subjectId !== subject.id) continue;
@@ -119,12 +102,10 @@ function computeSubjectHoursAccount(subject, state) {
     }
   }
 
-  // 2. Besuchte Vorlesungen summieren
   let lectureMinutes = 0;
   const lecStatus = state.lectureStatus || {};
   for (const [key, status] of Object.entries(lecStatus)) {
     if (status !== 'attended') continue;
-    // Key-Format: `${lectureId}__${dateStr}`
     const sepIdx = key.lastIndexOf('__');
     if (sepIdx < 0) continue;
     const lecId = key.slice(0, sepIdx);
@@ -160,17 +141,9 @@ function getTestLeadDays(test, settings) {
 
 /* --- Dynamische Prioritäts-Berechnung pro Fach und Tag --- */
 
-/**
- * Berechnet für ein Fach an einem bestimmten Datum `dateStr`:
- * - `baseScore`: Grundpriorität aus der festgelegten Reihenfolge
- * - `boostScore`: Dynamischer Boost durch anstehende Bonuspunkte-Tests, Wochenabgaben & Klausuren
- *                 (NUR wenn der Test/die Klausur bereits im aktiven Vorbereitungsfenster liegt!)
- * - `totalScore`: Gesamtwert für das Ranking an diesem Tag
- */
 function computeSubjectPriorityForDate(subject, dateStr, state) {
-  const totalSubjects = state.subjects.length || 6;
+  const totalSubjects = Math.max(1, state.subjects.length);
   const rank = subject.baseRank || 1;
-  // Basis-Score: Platz 1 = 90, Platz 2 = 75, Platz 3 = 60, Platz 4 = 45, Platz 5 = 30, Platz 6 = 15
   const baseScore = (totalSubjects - rank + 1) * 15;
 
   let boostScore = 0;
@@ -182,28 +155,20 @@ function computeSubjectPriorityForDate(subject, dateStr, state) {
     const deltaDays = daysBetween(dateStr, test.date);
     const leadDays = getTestLeadDays(test, state.settings);
 
-    // WICHTIG: Klausuren oder Tests, die noch weiter weg sind als `leadDays` (z. B. 3-4 Monate),
-    // lösen JETZT noch keinen Boost aus!
     if (deltaDays > leadDays) continue;
 
-    const rel = Number(test.relevance) || 3;   // 1..5
-    const diff = Number(test.difficulty) || 3; // 1..5
-
-    // Gewichtungsfaktor aus Relevanz & Schwierigkeit:
+    const rel = Number(test.relevance) || 3;
+    const diff = Number(test.difficulty) || 3;
     const weight = (0.3 + 0.7 * (rel / 5)) * (0.3 + 0.7 * (diff / 5)) * 3.2;
 
     const isExam = test.type === 'exam';
     let rawBoost = 0;
 
     if (isExam) {
-      // Klausur innerhalb des aktiven Vorbereitungsfensters (z. B. <= 14 Tage vor Klausur)
       rawBoost = (240 / Math.pow(deltaDays + 0.9, 1.15)) * weight;
     } else if (test.type === 'bonus_submission') {
-      // Einwöchige Bonuspunkte-Abgabe (z. B. MG): gleichmäßiger starker Boost über die Abgabewoche,
-      // der zum Abgabetermin hin ansteigt
       rawBoost = (130 / Math.pow(deltaDays + 0.8, 1.25)) * weight;
     } else {
-      // Klassischer Bonuspunkte-Test (z. B. am Montag -> starker Peak am Sa/So davor)
       rawBoost = (145 / Math.pow(deltaDays + 0.65, 1.45)) * weight;
     }
 
@@ -230,7 +195,7 @@ function computeSubjectPriorityForDate(subject, dateStr, state) {
 }
 
 function getRankedSubjectsForDate(dateStr, state) {
-  const list = state.subjects.map(s => computeSubjectPriorityForDate(s, dateStr, state));
+  const list = (state.subjects || []).map(s => computeSubjectPriorityForDate(s, dateStr, state));
   list.sort((a, b) => {
     if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
     return a.baseRank - b.baseRank;
@@ -240,40 +205,21 @@ function getRankedSubjectsForDate(dateStr, state) {
 
 /* --- Individuelle Aufgaben-Relevanz (1 bis 5) --- */
 
-/**
- * Berechnet den effektiven Prioritäts-Score einer konkreten Aufgabe an Tag `dateStr`.
- * Berücksichtigt:
- * 1. Grund-Score des Fachs + evtl. Test-Boost des Fachs
- * 2. Individuelle Relevanz der Aufgabe (1..5):
- *    - Wenn z. B. eine Mechanik-Aufgabe aus der Digitalwerkstatt Relevanz 1 (unwichtig / nicht klausurrelevant) hat,
- *      sinkt ihr Score drastisch unter normale Aufgaben in Mathe oder Werkstoffkunde!
- * 3. Eigene Abgabefrist (`due`) der Aufgabe
- */
 function computeTaskEffectiveScore(task, dateStr, subjPrio, state) {
   const baseSubjScore = subjPrio ? subjPrio.baseScore : 45;
   const subjBoost = subjPrio ? subjPrio.boostScore : 0;
-  const taskRel = Number(task.relevance) || 3; // 1..5
+  const taskRel = Number(task.relevance) || 3;
 
-  // Skalierung des Fach-Grundscores anhand der Aufgaben-Relevanz:
-  // Relevanz 1 (z. B. Digitalwerkstatt, kaum relevant): 0.25x - 10  (Mechanik 90 -> ~13, rutscht hinter Mathe 45 & MG!)
-  // Relevanz 2 (gering):                                0.58x - 5   (Mechanik 90 -> ~47, knapp bei Mathe)
-  // Relevanz 3 (normal):                                1.00x       (Normale Fach-Reihenfolge)
-  // Relevanz 4 (wichtig):                               1.30x + 15
-  // Relevanz 5 (sehr wichtig / Pflicht):                1.60x + 35
   const relMultipliers = { 1: 0.25, 2: 0.58, 3: 1.0, 4: 1.3, 5: 1.6 };
   const relOffsets     = { 1: -10,  2: -5,   3: 0,   4: 15,  5: 35 };
 
   const mult = relMultipliers[taskRel] ?? 1.0;
   const offset = relOffsets[taskRel] ?? 0;
 
-  // Wenn die Aufgabe nur geringe Relevanz (1 oder 2) hat und NICHT selbst die Testvorbereitung ist,
-  // bekommt sie auch nur einen Bruchteil des Fach-Testboosts
   const boostFactor = task.isTestPrep ? 1.0 : (taskRel <= 2 ? 0.25 : 1.0);
 
   let score = Math.round(baseSubjScore * mult + offset + subjBoost * boostFactor);
 
-  // Zusätzlicher Frist-Boost, falls die Aufgabe ein konkretes Abgabedatum (`due`) hat,
-  // das in Kürze ansteht (nur innerhalb des Vorlauf-Fensters!)
   if (task.due) {
     const dDue = daysBetween(dateStr, task.due);
     let maxDueLookahead = 7;
@@ -283,9 +229,8 @@ function computeTaskEffectiveScore(task, dateStr, subjPrio, state) {
     }
 
     if (dDue < 0) {
-      score += 200; // Überfällig
+      score += 200;
     } else if (dDue <= maxDueLookahead) {
-      // Skaliert ebenfalls mit der Relevanz der Aufgabe
       const dueWeight = 0.5 + 0.2 * taskRel;
       score += Math.round((110 * dueWeight) / (dDue + 0.8));
     }
@@ -343,19 +288,15 @@ function findAutomaticBreakWindow(freeList, prefStart, prefEnd, durationMin) {
 /* --- Prüfen, ob eine Aufgabe an Tag `dateStr` überhaupt schon eingeplant werden darf --- */
 
 function isTaskEligibleOnDate(task, dateStr, state) {
-  // 1. Manuell verschoben ("Später bearbeiten" / "In nächste Woche schieben")?
   if (task.notBefore && dateStr < task.notBefore) {
-    return { eligible: false, reason: `Manuell verschoben auf ab ${task.notBefore}` };
+    return { eligible: false, reason: `Verschoben auf ab ${task.notBefore}` };
   }
 
-  // 2. Gehört die Aufgabe zu einem Test / einer Klausur?
   if (task.testId) {
     const linkedTest = (state.tests || []).find(x => x.id === task.testId);
     if (linkedTest) {
       const deltaDays = daysBetween(dateStr, linkedTest.date);
       const leadDays = getTestLeadDays(linkedTest, state.settings);
-      // Wenn die Klausur z. B. erst in 3-4 Monaten (90 Tagen) ist, aber leadDays = 14 Tage ist:
-      // Jetzt noch NICHT in den Plan legen!
       if (deltaDays > leadDays) {
         const startPrepDate = addDays(linkedTest.date, -leadDays);
         return {
@@ -364,7 +305,6 @@ function isTaskEligibleOnDate(task, dateStr, state) {
           reason: `Startet erst ${leadDays} Tage vor ${linkedTest.type === 'exam' ? 'der Klausur' : 'dem Test'} (ab ${startPrepDate})`
         };
       }
-      // Nach dem Test-Datum auch nicht mehr neu als Vorbereitung vor dem Test einplanen
       if (deltaDays < 0) {
         return { eligible: false, reason: 'Prüfungstermin bereits vorbei' };
       }
@@ -382,7 +322,6 @@ function generateSchedule(state) {
   const todayStr = toDateStr(new Date());
   const lecStatus = state.lectureStatus || {};
 
-  // 1. Arbeitskopie aller offenen Aufgaben (inkl. Restzeit & Relevanz)
   const activeTasks = (state.tasks || [])
     .filter(t => !t.done && (Number(t.remainingMinutes) || 0) > 0)
     .map(t => ({
@@ -412,11 +351,9 @@ function generateSchedule(state) {
     const weekday = getWeekdayIso(dateStr);
     const isToday = dIdx === 0;
 
-    // Tages-Prioritäten aller Fächer berechnen
     const rankedSubjects = getRankedSubjectsForDate(dateStr, state);
     const subjScoreMap = new Map(rankedSubjects.map(r => [r.subjectId, r]));
 
-    // Prüfen, ob an diesem Tag ein ganztägiger Außer-Haus-Termin / Urlaub vorliegt
     const dayEvents = (state.events || []).filter(ev => {
       const s = ev.startDate || ev.date;
       const e = ev.endDate || s;
@@ -450,7 +387,6 @@ function generateSchedule(state) {
       continue;
     }
 
-    // Startzeit des Tages bestimmen
     let dayStartMin = timeToMin(settings.dayStart);
     if (isToday) {
       if (settings.todayStartOverride) {
@@ -465,18 +401,14 @@ function generateSchedule(state) {
     const normalEndMin = timeToMin(settings.dayEnd);
     const crunchEndMin = timeToMin(settings.crunchEnd || '23:00');
 
-    // Alle festen Termine (Vorlesungen, Außer-Haus, Präsenz-Tests/Klausuren) sammeln
     const fixedBlocks = [];
 
-    // 1. Wiederkehrende Vorlesungen an diesem Wochentag
     const dayLectures = (state.lectures || []).filter(l => Number(l.weekday) === weekday);
     for (const lec of dayLectures) {
       const statusKey = `${lec.id}__${dateStr}`;
-      const curStatus = lecStatus[statusKey] || 'planned'; // 'planned' | 'attended' | 'skipped'
+      const curStatus = lecStatus[statusKey] || 'planned';
 
       if (curStatus === 'skipped') {
-        // Nutzer hat angegeben: "Dort gehe ich diese Woche nicht hin"
-        // -> Vorlesung blockiert KEINE Zeit, stattdessen kann hier gelernt werden!
         skippedLecturesToday.push({
           lectureId: lec.id,
           dateStr,
@@ -490,7 +422,7 @@ function generateSchedule(state) {
 
       const sMin = timeToMin(lec.start);
       const eMin = timeToMin(lec.end);
-      const subj = state.subjects.find(s => s.id === lec.subjectId);
+      const subj = (state.subjects || []).find(s => s.id === lec.subjectId);
       if (eMin > sMin) {
         fixedBlocks.push({
           type: 'lecture',
@@ -499,7 +431,7 @@ function generateSchedule(state) {
           subjectId: lec.subjectId || '',
           subjectName: subj ? subj.name : '',
           color: subj ? subj.color : '#64748b',
-          attendanceStatus: curStatus, // 'planned' | 'attended'
+          attendanceStatus: curStatus,
           startMin: sMin,
           endMin: eMin,
           durationMin: eMin - sMin,
@@ -510,7 +442,6 @@ function generateSchedule(state) {
       }
     }
 
-    // 2. Außer-Haus-Termine mit Uhrzeit an diesem Tag
     for (const ev of dayEvents) {
       if (!ev.allDay && ev.start && ev.end) {
         const sMin = timeToMin(ev.start);
@@ -528,13 +459,10 @@ function generateSchedule(state) {
       }
     }
 
-    // 3. Tests & Klausuren an diesem Tag
     const dayTests = (state.tests || []).filter(t => t.date === dateStr);
     for (const test of dayTests) {
-      const subj = state.subjects.find(s => s.id === test.subjectId);
+      const subj = (state.subjects || []).find(s => s.id === test.subjectId);
       if (test.type === 'bonus_submission') {
-        // Einwöchige Bonuspunkte-Abgabe (z. B. MG): Blockiert keine 300 Min. im Kalender,
-        // sondern wird als kompakter Abgabe-Hinweis am Fälligkeitstag angezeigt
         const dueMin = timeToMin(test.start || '18:00');
         fixedBlocks.push({
           type: 'test',
@@ -564,7 +492,6 @@ function generateSchedule(state) {
 
     fixedBlocks.sort((a, b) => a.startMin - b.startMin);
 
-    // Wegezeiten / Gebäudewechsel vor & nach Vorlesungen/Terminen erzeugen
     const bufferBlocks = [];
     const realFixedBlocks = fixedBlocks.filter(b => b.endMin > b.startMin);
     if (transitMin > 0) {
@@ -610,7 +537,6 @@ function generateSchedule(state) {
       return free.filter(([s, e]) => e - s >= 20);
     };
 
-    // Automatische Essens- & Nachmittagspause (Standard 75 Min.) zwischen 11:45 und 17:00
     const autoMeals = [];
     if (dayStartMin < 15 * 60 && afternoonBreakMin > 0) {
       const prelimFree = buildFreeIntervals(Math.max(dayStartMin, 11 * 60 + 45), Math.max(normalEndMin, 17 * 60), []);
@@ -628,7 +554,6 @@ function generateSchedule(state) {
       }
     }
 
-    // Auswahl der wichtigsten Aufgabe für einen Zeitslot an Tag `dateStr`
     const pickBestTaskForDay = (currentSlotStartMin) => {
       let bestTask = null;
       let bestScore = -Infinity;
@@ -685,7 +610,7 @@ function generateSchedule(state) {
 
           if (blockLen < 15 && blockLen < task.remainingMinutes) break;
 
-          const subj = state.subjects.find(s => s.id === task.subjectId);
+          const subj = (state.subjects || []).find(s => s.id === task.subjectId);
           const subjPrio = subjScoreMap.get(task.subjectId);
 
           timeline.push({
@@ -731,11 +656,9 @@ function generateSchedule(state) {
       }
     };
 
-    // 1. Durchgang: Normales Tagesfenster (08:30 bis 20:00)
     const normalFree = buildFreeIntervals(dayStartMin, normalEndMin, autoMeals);
     scheduleIntoFreeWindows(normalFree, maxNormalStudy, false);
 
-    // 2. Durchgang: Ausnahme-Crunch-Modus bis max. 23:00 Uhr NUR wenn in <= 2 Tagen ein Test/Klausur oder eine Frist ansteht
     const hasUrgentTestSoon = (state.tests || []).some(t => {
       const diff = daysBetween(dateStr, t.date);
       return diff >= 0 && diff <= 2;
@@ -796,9 +719,6 @@ function generateSchedule(state) {
     });
   }
 
-  // Unterscheide bei noch nicht eingeplanten Aufgaben zwischen:
-  // a) Aufgaben, die absichtlich erst später starten (z. B. Klausuren in 3-4 Monaten oder auf "Nächste Woche" geschoben)
-  // b) Aufgaben, die eigentlich jetzt fällig wären, aber wegen Zeitmangel nicht in die 10 Tage gepasst haben
   const lastDayStr = addDays(todayStr, horizon - 1);
   const deferredFutureTasks = [];
   const unscheduledTasks = [];
