@@ -131,8 +131,6 @@ function computeSubjectHoursAccount(subject, state) {
   };
 }
 
-/* --- Prüfen, ab wann ein Test / eine Klausur aktiv vorbereitet wird --- */
-
 function getTestLeadDays(test, settings) {
   if (test.leadDays && Number(test.leadDays) > 0) return Number(test.leadDays);
   if (test.type === 'exam') return Number(settings?.examPrepLeadDays) || 14;
@@ -243,7 +241,7 @@ function computeTaskEffectiveScore(task, dateStr, subjPrio, state) {
   return score;
 }
 
-/* --- Intervall-Arithmetik für Tages-Zeitfenster --- */
+/* --- Intervall-Arithmetik --- */
 
 function subtractInterval(freeList, bStart, bEnd) {
   if (bEnd <= bStart) return freeList;
@@ -284,8 +282,6 @@ function findAutomaticBreakWindow(freeList, prefStart, prefEnd, durationMin) {
   }
   return bestSlot;
 }
-
-/* --- Prüfen, ob eine Aufgabe an Tag `dateStr` überhaupt schon eingeplant werden darf --- */
 
 function isTaskEligibleOnDate(task, dateStr, state) {
   if (task.notBefore && dateStr < task.notBefore) {

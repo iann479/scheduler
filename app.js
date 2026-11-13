@@ -1,5 +1,5 @@
 /* ==========================================================================
-   app.js – State Management, SHA-256 Login/Account-Speicher & Interaktive UI
+   app.js – State Management, Smart SHA-256 Login/Sync & Interaktive UI
    ========================================================================== */
 
 const LEGACY_STORAGE_KEY = 'uni_smart_planner_v1';
@@ -19,13 +19,13 @@ const RELEVANCE_LABELS = {
   5: '5 – Sehr wichtig'
 };
 
-let PUBLIC_USERS_FILE = { users: {} }; // Geladen aus ./users.json falls vorhanden
+let PUBLIC_USERS_FILE = { users: {} };
+let SERVER_USERS_LIST = [];
 let SESSION = loadSession();
 let S = loadStateForCurrentUser();
 
 let UI = {
   tab: 'plan',               // 'plan' | 'tasks' | 'subjects' | 'tests' | 'schedule' | 'settings'
-  authMode: 'login',         // 'login' | 'register'
   authError: '',
   selectedDayStr: toDateStr(new Date()),
   progressModalTaskId: null,
@@ -97,7 +97,6 @@ async function computePasswordHash(username, password) {
     const digest = await window.crypto.subtle.digest('SHA-256', buf);
     return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
   }
-  // Fallback falls file:// ohne WebCrypto
   let h1 = 0xdeadbeef ^ salted.length, h2 = 0x41c6ce57 ^ salted.length;
   for (let i = 0, ch; i < salted.length; i++) {
     ch = salted.charCodeAt(i);
@@ -134,10 +133,25 @@ function saveUserToLocalRegistry(username, passHash, stateObj) {
   } catch (e) {}
 }
 
+function deleteUserFromLocalRegistry(usernameKey) {
+  const key = cleanUsername(usernameKey);
+  try {
+    const local = JSON.parse(localStorage.getItem(USERS_REGISTRY_KEY)) || {};
+    delete local[key];
+    localStorage.setItem(USERS_REGISTRY_KEY, JSON.stringify(local));
+  } catch (e) {}
+  if (PUBLIC_USERS_FILE && PUBLIC_USERS_FILE.users) {
+    delete PUBLIC_USERS_FILE.users[key];
+  }
+  try {
+    localStorage.removeItem(getUserStorageKey(key));
+  } catch (e) {}
+}
+
 async function initPublicUsersAndBackend() {
   // 1. Lade öffentliche users.json (falls im Projektordner hinterlegt)
   try {
-    const res = await fetch('users.json', { cache: 'no-store' });
+    const res = await fetch('users.json?t=' + Date.now(), { cache: 'no-store' });
     if (res.ok) {
       const data = await res.json();
       if (data && typeof data.users === 'object') {
@@ -153,9 +167,10 @@ async function initPublicUsersAndBackend() {
       const info = await res.json();
       if (info && info.ok) {
         UI.netlifyAvailable = true;
-        UI.cloudStatusMsg = '☁️ Netlify Server aktiv';
+        UI.cloudStatusMsg = '☁️ Server-Sync aktiv';
+        await refreshServerUsersList();
         if (SESSION && SESSION.username && SESSION.passHash) {
-          await syncWithNetlify('login');
+          await syncWithNetlify('auth');
         }
         render();
       }
@@ -163,7 +178,22 @@ async function initPublicUsersAndBackend() {
   } catch (e) {}
 }
 
-async function syncWithNetlify(action) {
+async function refreshServerUsersList() {
+  if (!UI.netlifyAvailable) return;
+  try {
+    const res = await fetch('/.netlify/functions/api', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'list_users' })
+    });
+    const data = await res.json();
+    if (res.ok && data.ok && Array.isArray(data.users)) {
+      SERVER_USERS_LIST = data.users;
+    }
+  } catch (e) {}
+}
+
+async function syncWithNetlify(action, extra = {}) {
   if (!UI.netlifyAvailable || !SESSION) return null;
   try {
     const res = await fetch('/.netlify/functions/api', {
@@ -173,12 +203,13 @@ async function syncWithNetlify(action) {
         action,
         username: SESSION.username,
         passHash: SESSION.passHash,
-        state: S
+        state: S,
+        ...extra
       })
     });
     const data = await res.json();
     if (res.ok && data.ok) {
-      if (data.state && action === 'login') {
+      if (data.state && (action === 'auth' || action === 'login')) {
         S = normalizeStateObject(data.state);
         saveState(true);
         render();
@@ -269,10 +300,10 @@ function loadStateForCurrentUser() {
     raw = JSON.parse(localStorage.getItem(userKey));
   } catch (e) {}
 
-  if (!raw) {
-    const reg = getLocalUsersRegistry();
-    const entry = reg[cleanUsername(SESSION.username)];
-    if (entry && entry.state) {
+  const reg = getLocalUsersRegistry();
+  const entry = reg[cleanUsername(SESSION.username)];
+  if (entry && entry.state) {
+    if (!raw || (entry.updatedAt && (!raw.updatedAt || entry.updatedAt > raw.updatedAt))) {
       raw = entry.state;
     }
   }
@@ -294,7 +325,7 @@ function saveState(skipRemote = false) {
   if (!skipRemote) {
     if (UI.netlifyAvailable) {
       clearTimeout(netlifySaveTimer);
-      netlifySaveTimer = setTimeout(() => syncWithNetlify('save'), 600);
+      netlifySaveTimer = setTimeout(() => syncWithNetlify('save'), 500);
     }
     pushToCloudIfConfigured();
   }
@@ -315,7 +346,7 @@ function getCloudEndpoint() {
 
 async function pullFromCloudIfConfigured(showFeedback = false) {
   const url = getCloudEndpoint();
-  if (!url) return;
+  if (!url) return false;
   try {
     const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -326,13 +357,16 @@ async function pullFromCloudIfConfigured(showFeedback = false) {
       UI.cloudStatusMsg = '☁️ Synchronisiert';
       if (showFeedback) showToast('☁️ Plan aus der Cloud geladen!');
       render();
+      return true;
     } else if (data === null) {
       await pushToCloudIfConfigured(true);
+      return true;
     }
   } catch (err) {
     UI.cloudStatusMsg = '⚠️ Cloud-Fehler';
     if (showFeedback) showToast('Cloud-Abruf fehlgeschlagen: ' + err.message);
   }
+  return false;
 }
 
 let cloudPushTimer = null;
@@ -374,21 +408,20 @@ function getSubject(subjectId) {
   return S.subjects.find(s => s.id === subjectId) || S.subjects[0] || { id: '', name: 'Kein Fach', color: '#64748b', baseRank: 1, cp: 6 };
 }
 
-/* --- Login & Registrierungs-Fenster --- */
+/* --- Vereinheitlichtes Login-Fenster (funktioniert sofort auf Mac & Handy!) --- */
 
 function renderLoginScreen() {
   const isDark = getTheme() === 'dark';
-  const isReg = UI.authMode === 'register';
 
   return `
     <div class="login-wrap">
       <div class="login-card">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
           <div class="brand">
             <div class="brand-icon">⚡</div>
             <div>
-              <h1 style="font-size:19px">Uni Smart-Planer</h1>
-              <div style="font-size:12px;color:var(--mu)">${isReg ? 'Neues Benutzerkonto erstellen' : 'Anmelden'}</div>
+              <h1 style="font-size:18.5px">Uni Smart-Planer</h1>
+              <div style="font-size:12px;color:var(--mu)">Anmelden oder neues Konto starten</div>
             </div>
           </div>
           <button class="btn btn-sm" data-action="toggle-theme" title="Design wechseln">
@@ -396,17 +429,12 @@ function renderLoginScreen() {
           </button>
         </div>
 
-        <div style="display:flex;gap:6px;margin-bottom:16px;background:var(--bg);padding:4px;border-radius:10px;border:1px solid var(--ln)">
-          <button type="button" class="nav-tab ${!isReg ? 'active' : ''}" style="flex:1;justify-content:center" data-action="switch-auth-mode" data-mode="login">
-            🔑 Anmelden
-          </button>
-          <button type="button" class="nav-tab ${isReg ? 'active' : ''}" style="flex:1;justify-content:center" data-action="switch-auth-mode" data-mode="register">
-            ➕ Registrieren
-          </button>
-        </div>
+        <p style="font-size:13px;color:var(--mu);margin-top:0;margin-bottom:14px">
+          Gib deinen Benutzernamen und dein Passwort ein. Wenn das Konto schon existiert, wirst du angemeldet – wenn der Name noch frei ist, wird dein Konto automatisch erstellt.
+        </p>
 
         ${UI.authError ? `
-          <div style="padding:9px 12px;margin-bottom:12px;border-radius:8px;background:var(--rd-soft);color:var(--rd);border:1px solid var(--rd);font-size:13px;font-weight:600">
+          <div style="padding:10px 12px;margin-bottom:12px;border-radius:8px;background:var(--rd-soft);color:var(--rd);border:1px solid var(--rd);font-size:13px;font-weight:600">
             ${esc(UI.authError)}
           </div>
         ` : ''}
@@ -414,14 +442,14 @@ function renderLoginScreen() {
         <form id="auth-form" class="form-stack">
           <div>
             <label>Benutzername</label>
-            <input type="text" name="username" placeholder="Benutzername" required autocomplete="username">
+            <input type="text" name="username" placeholder="Benutzername" required autocomplete="username" autocapitalize="none" autocorrect="off">
           </div>
           <div>
             <label>Passwort</label>
-            <input type="password" name="password" placeholder="Passwort" required autocomplete="${isReg ? 'new-password' : 'current-password'}">
+            <input type="password" name="password" placeholder="Passwort" required autocomplete="current-password">
           </div>
-          <button type="submit" class="btn btn-primary" style="width:100%;padding:10px;margin-top:4px">
-            ${isReg ? 'Konto erstellen & starten' : 'Anmelden'}
+          <button type="submit" class="btn btn-primary" style="width:100%;padding:11px;margin-top:4px;font-size:14.5px">
+            Anmelden / Konto öffnen
           </button>
         </form>
       </div>
@@ -488,7 +516,7 @@ function render() {
 
         <div class="top-actions">
           <button class="btn btn-sm" data-action="toggle-theme" title="Zwischen Darkmode und Lightmode wechseln">
-            ${isDark ? '☀️ Light' : '🌙 Dark'}
+            ${isDark ? '☀️' : '🌙'}
           </button>
           <button class="btn btn-sm" data-action="recalc-now" title="Plan ab aktueller Uhrzeit sofort neu berechnen">
             ↻ Neu planen
@@ -572,7 +600,7 @@ function renderStickyCockpit(plan) {
           <div class="prio-pills">
             ${pills}
             <button class="btn btn-sm" data-action="toggle-cockpit-compact" title="Status-Karten ein-/ausklappen" style="margin-left:4px">
-              ${UI.cockpitCompact ? '▼ Status zeigen' : '▲ Kompakt'}
+              ${UI.cockpitCompact ? '▼ Status' : '▲ Kompakt'}
             </button>
           </div>
         </div>
@@ -597,7 +625,7 @@ function renderStickyCockpit(plan) {
             <div class="stat-card">
               <div class="stat-label">Heute planen ab Uhrzeit</div>
               <div style="display:flex;gap:5px;align-items:center;margin-top:1px">
-                <input type="time" id="today-override-inp" value="${esc(S.settings.todayStartOverride || '')}" style="padding:3px 7px;width:105px;font-size:12.5px">
+                <input type="time" id="today-override-inp" value="${esc(S.settings.todayStartOverride || '')}" style="padding:3px 7px;width:105px;font-size:13px">
                 <button class="btn btn-sm" data-action="set-today-start">Setzen</button>
                 ${S.settings.todayStartOverride ? `<button class="btn btn-sm" data-action="clear-today-start">Auto</button>` : ''}
               </div>
@@ -610,7 +638,7 @@ function renderStickyCockpit(plan) {
   `;
 }
 
-/* --- TAB 1: 10-Tage-Lernplan (Volle Breite) --- */
+/* --- TAB 1: 10-Tage-Lernplan --- */
 
 function renderPlanView(plan) {
   return `
@@ -627,11 +655,11 @@ function renderPlanView(plan) {
 
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
-          <h2 style="margin:0;font-size:18px">🗓️ Automatischer Lern- & Terminplan (${plan.horizonDays} Tage)</h2>
-          <span style="font-size:12.5px;color:var(--mu)">Klicke auf einen Tag, um oben dessen Prioritäten zu sehen · Vorlesungen können als „✓ Besucht“ oder „🚫 Gehe ich nicht hin“ markiert werden</span>
+          <h2 style="margin:0;font-size:17.5px">🗓️ Automatischer Lern- & Terminplan (${plan.horizonDays} Tage)</h2>
+          <span style="font-size:12px;color:var(--mu)">Tippe auf einen Tag, um oben dessen Prioritäten zu sehen · Vorlesungen können als „✓ Besucht“ oder „🚫 Gehe ich nicht hin“ markiert werden</span>
         </div>
         <button class="btn btn-primary" data-action="tab" data-tab="tasks">
-          ➕ Neue Aufgabe eintragen / verwalten
+          ➕ Neue Aufgabe eintragen
         </button>
       </div>
 
@@ -658,7 +686,7 @@ function renderTaskCardCompact(t) {
       </div>
       <div class="task-badges">
         <span class="badge badge-subj" style="--sc:${subj.color}"><i></i>${esc(subj.name)}</span>
-        <span class="badge" title="Individuelle Relevanz dieser Aufgabe">⭐ Rel: <b>${t.relevance || 3}/5</b></span>
+        <span class="badge">⭐ Rel: <b>${t.relevance || 3}/5</b></span>
         ${t.due ? `<span class="badge">📅 Frist: ${formatDateNice(t.due)}</span>` : ''}
         ${t.isTestPrep ? `<span class="badge" style="color:var(--warn)">🎯 Prüfungsvorbereitung</span>` : ''}
         ${!elig.eligible ? `<span class="badge" style="color:var(--warn);border-color:var(--warn)">⏸ ${esc(elig.reason)}</span>` : ''}
@@ -678,12 +706,12 @@ function renderTaskCardCompact(t) {
       ` : ''}
 
       <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:2px">
-        <button class="btn btn-sm btn-ok" data-action="task-done" data-id="${t.id}" title="Als fertig markieren & Zeit auf das Fach-Stundenkonto buchen">✓ Fertig</button>
-        <button class="btn btn-sm btn-warn" data-action="task-partial" data-id="${t.id}">⏱ Teilweise / Restzeit</button>
-        <button class="btn btn-sm" data-action="task-postpone-day" data-id="${t.id}" title="Aufgabe um 1 Tag nach hinten schieben">⏭ Später (+1T)</button>
-        <button class="btn btn-sm" data-action="task-postpone-week" data-id="${t.id}" title="Aufgabe in die nächste Woche schieben">📅 Nächste Woche</button>
-        ${t.notBefore ? `<button class="btn btn-sm" data-action="task-unpostpone" data-id="${t.id}" title="Sofort wieder im Plan freigeben">▶ Jetzt</button>` : ''}
-        <button class="btn btn-sm btn-danger" data-action="task-del" data-id="${t.id}" title="Löschen">🗑</button>
+        <button class="btn btn-sm btn-ok" data-action="task-done" data-id="${t.id}">✓ Fertig</button>
+        <button class="btn btn-sm btn-warn" data-action="task-partial" data-id="${t.id}">⏱ Restzeit</button>
+        <button class="btn btn-sm" data-action="task-postpone-day" data-id="${t.id}">⏭ Später (+1T)</button>
+        <button class="btn btn-sm" data-action="task-postpone-week" data-id="${t.id}">📅 Nächste Woche</button>
+        ${t.notBefore ? `<button class="btn btn-sm" data-action="task-unpostpone" data-id="${t.id}">▶ Jetzt</button>` : ''}
+        <button class="btn btn-sm btn-danger" data-action="task-del" data-id="${t.id}">🗑</button>
       </div>
     </div>
   `;
@@ -702,7 +730,7 @@ function renderDayColumn(day) {
           <div class="day-title">
             <span>${formatDateNice(day.dateStr)}</span>
             ${day.isToday ? `<span class="today-badge">Heute</span>` : ''}
-            ${day.isCrunch ? `<span class="crunch-badge" title="Ausnahme-Spätschicht wegen dringendem Test/Frist">⚡ Ausnahme bis ≤23h</span>` : ''}
+            ${day.isCrunch ? `<span class="crunch-badge">⚡ Ausnahme bis ≤23h</span>` : ''}
           </div>
           <div class="day-meta">
             ${day.allDayBlocked ? 'Ganztägig blockiert / Urlaub' : `Geplante Lernzeit: <b>${formatDuration(day.studyMinutesPlanned)}</b>`}
@@ -711,7 +739,7 @@ function renderDayColumn(day) {
       </div>
 
       ${top3.length > 0 ? `
-        <div class="day-prio-mini" title="Top-Prioritäten an diesem Tag">
+        <div class="day-prio-mini">
           <span>Top:</span>
           ${top3.map((r, i) => `
             <span class="mini-dot" style="--sc:${r.color}">
@@ -792,7 +820,7 @@ function renderSlotItem(slot, day) {
                   data-action="lec-toggle-attend"
                   data-lecid="${slot.lectureId}"
                   data-date="${day.dateStr}">
-            ${isAttended ? `✅ Besucht (+${hrsStr} Std. gezählt)` : `✓ Besucht (+${hrsStr} Std.)`}
+            ${isAttended ? `✅ Besucht (+${hrsStr} Std.)` : `✓ Besucht (+${hrsStr} Std.)`}
           </button>
           <button class="btn btn-sm btn-danger"
                   data-action="lec-skip"
@@ -855,7 +883,7 @@ function renderSlotItem(slot, day) {
   return '';
 }
 
-/* --- TAB 2: Aufgaben (Eintragen & Verwalten) --- */
+/* --- TAB 2: Aufgaben --- */
 
 function renderTasksView() {
   const todayStr = toDateStr(new Date());
@@ -864,7 +892,6 @@ function renderTasksView() {
 
   return `
     <div class="two-col">
-      <!-- Links: Neue Aufgabe eintragen -->
       <section class="panel">
         <div class="panel-head">
           <h2>➕ Neue Aufgabe eintragen</h2>
@@ -919,7 +946,6 @@ function renderTasksView() {
         `}
       </section>
 
-      <!-- Rechts: Offene & erledigte Aufgaben -->
       <section class="panel">
         <div class="panel-head">
           <h2>📋 Aufgaben-Übersicht</h2>
@@ -1334,10 +1360,20 @@ function renderScheduleView() {
   `;
 }
 
-/* --- TAB 6: Pausen, CP-Faktor & Account-Speicher --- */
+/* --- TAB 6: Pausen, CP-Faktor & Account-Verwaltung --- */
 
 function renderSettingsView() {
   const st = S.settings;
+  const localReg = getLocalUsersRegistry();
+  const allUserMap = new Map();
+
+  for (const [k, v] of Object.entries(localReg)) {
+    allUserMap.set(k, { key: k, username: v.username || k, source: 'Lokal / users.json' });
+  }
+  for (const u of SERVER_USERS_LIST) {
+    allUserMap.set(u.key, { key: u.key, username: u.username || u.key, source: 'Netlify Server' });
+  }
+  const allAccounts = Array.from(allUserMap.values());
 
   return `
     <div class="two-col">
@@ -1424,32 +1460,51 @@ function renderSettingsView() {
       <div style="display:flex;flex-direction:column;gap:18px">
         <section class="panel">
           <div class="panel-head">
-            <h2>🔐 Benutzerkonto & Passwort-Speicher</h2>
+            <h2>🔐 Benutzerkonto & Geräte-Sync</h2>
             <button class="btn btn-sm btn-danger" data-action="logout">Abmelden</button>
           </div>
           <p style="font-size:13px;color:var(--mu);margin-top:0">
             Eingeloggt als: <b>${esc(SESSION.username)}</b><br>
-            Dein Passwort wird niemals im Klartext gespeichert, sondern als <b>SHA-256 Hash</b> (<code>${esc(SESSION.passHash.slice(0, 16))}…</code>).
-            Dadurch kann die Datei <code>users.json</code> bedenkenlos öffentlich im Repository liegen.
+            Status: <b>${UI.netlifyAvailable ? '☁️ Netlify Server-Datenbank verbunden (automatischer Sync zwischen Mac & Handy)' : '📁 Lokaler / users.json Modus'}</b>
           </p>
 
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
             <button class="btn btn-primary" data-action="export-users-json">
-              🔑 users.json herunterladen (SHA-256 Account-Datei)
+              🔑 users.json herunterladen (Account + Plan für GitHub)
             </button>
             <button class="btn" data-action="export-json">
-              💾 Eigenen Plan exportieren
+              💾 Plan-Backup exportieren
             </button>
             <label class="btn" style="margin:0;cursor:pointer">
-              📂 Plan importieren
+              📂 Plan-Backup importieren
               <input type="file" id="import-json-inp" accept=".json" style="display:none">
             </label>
           </div>
+        </section>
 
-          <hr style="border:0;border-top:1px solid var(--ln);margin:16px 0">
+        <!-- Accounts verwalten & löschen -->
+        <section class="panel">
+          <div class="panel-head">
+            <h2>👥 Gespeicherte Accounts verwalten (${allAccounts.length})</h2>
+          </div>
+          ${allAccounts.length === 0 ? `<div class="empty-box">Keine Accounts gefunden.</div>` : `
+            <div class="task-list" style="margin-bottom:14px">
+              ${allAccounts.map(acc => `
+                <div class="subj-item" style="--sc:var(--ac)">
+                  <div>
+                    <b>${esc(acc.username)}</b>
+                    <span style="font-size:11.5px;color:var(--mu);margin-left:6px">(${esc(acc.source)})</span>
+                  </div>
+                  <button class="btn btn-sm btn-danger" data-action="delete-account" data-user="${esc(acc.key)}">
+                    🗑 Account löschen
+                  </button>
+                </div>
+              `).join('')}
+            </div>
+          `}
 
           <button class="btn btn-danger" data-action="reset-all" style="width:100%">
-            🗑 Alle Daten dieses Accounts zurücksetzen
+            🗑 Alle Plan-Daten des aktuellen Accounts leeren
           </button>
         </section>
       </div>
@@ -1503,20 +1558,13 @@ function renderProgressModal() {
 
 /* --- Event-Listener --- */
 
-document.addEventListener('click', e => {
+document.addEventListener('click', async e => {
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
   const action = btn.dataset.action;
 
   if (action === 'toggle-theme') {
     toggleTheme();
-    return;
-  }
-
-  if (action === 'switch-auth-mode') {
-    UI.authMode = btn.dataset.mode;
-    UI.authError = '';
-    render();
     return;
   }
 
@@ -1542,6 +1590,26 @@ document.addEventListener('click', e => {
     return;
   }
 
+  if (action === 'delete-account') {
+    const targetKey = btn.dataset.user;
+    if (!targetKey) return;
+    if (!confirm(`Account „${targetKey}“ wirklich komplett löschen?`)) return;
+
+    deleteUserFromLocalRegistry(targetKey);
+    if (UI.netlifyAvailable) {
+      await syncWithNetlify('delete_user', { targetUser: targetKey });
+      await refreshServerUsersList();
+    }
+
+    if (SESSION && cleanUsername(SESSION.username) === cleanUsername(targetKey)) {
+      localStorage.removeItem(AUTH_SESSION_KEY);
+      SESSION = null;
+    }
+    render();
+    showToast(`Account „${targetKey}“ gelöscht.`);
+    return;
+  }
+
   if (action === 'export-users-json') {
     const reg = getLocalUsersRegistry();
     const blob = new Blob([JSON.stringify({ users: reg }, null, 2)], { type: 'application/json' });
@@ -1549,7 +1617,7 @@ document.addEventListener('click', e => {
     a.href = URL.createObjectURL(blob);
     a.download = 'users.json';
     a.click();
-    showToast('users.json (mit SHA-256 Passwort-Hashes) heruntergeladen.');
+    showToast('users.json heruntergeladen. Lade sie auf GitHub hoch, um Accounts überall bereitzustellen.');
     return;
   }
 
@@ -1566,6 +1634,9 @@ document.addEventListener('click', e => {
   if (action === 'tab') {
     UI.tab = btn.dataset.tab;
     UI.mobileMenuOpen = false;
+    if (UI.tab === 'settings' && UI.netlifyAvailable) {
+      refreshServerUsersList().then(() => render());
+    }
     render();
     return;
   }
@@ -1829,7 +1900,7 @@ document.addEventListener('click', e => {
   }
 
   if (action === 'reset-all') {
-    if (confirm('Wirklich alle Daten dieses Accounts zurücksetzen?')) {
+    if (confirm('Wirklich alle Plan-Daten dieses Accounts zurücksetzen?')) {
       S = normalizeStateObject(null);
       saveState();
       render();
@@ -1926,15 +1997,12 @@ document.addEventListener('submit', async e => {
 
     const uKey = cleanUsername(username);
     const passHash = await computePasswordHash(username, password);
-    const reg = getLocalUsersRegistry();
-    const existingLocal = reg[uKey];
-
     UI.authError = '';
 
-    // 1. Falls Netlify Backend aktiv ist, prüfe / registriere direkt auf dem Server
+    // 1. Falls Netlify Backend aktiv ist -> Kombinierte Anmeldung / Auto-Registrierung auf dem Server
     if (UI.netlifyAvailable) {
       SESSION = { username, passHash };
-      const resp = await syncWithNetlify(UI.authMode === 'register' ? 'register' : 'login');
+      const resp = await syncWithNetlify('auth');
       if (!resp || !resp.ok) {
         SESSION = null;
         UI.authError = resp?.error || 'Anmeldung fehlgeschlagen.';
@@ -1944,41 +2012,28 @@ document.addEventListener('submit', async e => {
       localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
       S = resp.data?.state ? normalizeStateObject(resp.data.state) : loadStateForCurrentUser();
       saveState(true);
+      await refreshServerUsersList();
       render();
       showToast(`Angemeldet als ${username}`);
       return;
     }
 
-    // 2. Lokale / users.json Prüfung (mit SHA-256 Passwort-Hash)
-    if (UI.authMode === 'register') {
-      if (existingLocal && existingLocal.passHash && existingLocal.passHash !== passHash) {
-        UI.authError = 'Dieser Benutzername ist bereits vergeben.';
-        render();
-        return;
-      }
-      SESSION = { username, passHash };
-      localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
-      S = loadStateForCurrentUser();
-      saveState();
+    // 2. Prüfung über users.json / lokalen Speicher (kein Blockieren auf neuem Gerät!)
+    const reg = getLocalUsersRegistry();
+    const existingLocal = reg[uKey];
+
+    if (existingLocal && existingLocal.passHash && existingLocal.passHash !== passHash) {
+      UI.authError = 'Falsches Passwort für diesen Benutzernamen.';
       render();
-      showToast(`Konto „${username}“ erstellt!`);
-    } else {
-      if (!existingLocal) {
-        UI.authError = 'Benutzerkonto nicht gefunden. Bitte wechsle oben auf „➕ Registrieren“, um es neu anzulegen.';
-        render();
-        return;
-      }
-      if (existingLocal.passHash !== passHash) {
-        UI.authError = 'Falsches Passwort für diesen Benutzernamen.';
-        render();
-        return;
-      }
-      SESSION = { username, passHash };
-      localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
-      S = loadStateForCurrentUser();
-      render();
-      showToast(`Willkommen zurück, ${username}!`);
+      return;
     }
+
+    SESSION = { username, passHash };
+    localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(SESSION));
+    S = loadStateForCurrentUser();
+    saveState();
+    render();
+    showToast(`Angemeldet als ${username}`);
     return;
   }
 
@@ -2122,7 +2177,7 @@ document.addEventListener('submit', async e => {
     S.settings.maxBlockMin = Number(f.maxBlockMin.value) || 60;
     S.settings.minBreakMin = Number(f.minBreakMin.value) || 15;
     S.settings.longBreakMin = Number(f.longBreakMin.value) || 30;
-    S.settings.transitBufferMin = Number(f.transitBufferMin.value) || 20;
+    S.settings.transitBufferMin = Number(f.transitBufferMin) || 20;
     S.settings.afternoonBreakMin = Number(f.afternoonBreakMin.value) || 75;
     S.settings.dinnerBreakMin = Number(f.dinnerBreakMin.value) || 45;
     S.settings.horizonDays = Number(f.horizonDays.value) || 10;
