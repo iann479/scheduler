@@ -29,6 +29,7 @@ let UI = {
   authError: '',
   selectedDayStr: toDateStr(new Date()),
   progressModalTaskId: null,
+  editModal: null,           // { type: 'task'|'test'|'lecture'|'event'|'subject'|'day'|'buffer'|'break', ... }
   filterSubjectId: 'all',
   mobileMenuOpen: false,
   cockpitCompact: false,
@@ -149,7 +150,6 @@ function deleteUserFromLocalRegistry(usernameKey) {
 }
 
 async function initPublicUsersAndBackend() {
-  // 1. Lade öffentliche users.json (falls im Projektordner hinterlegt)
   try {
     const res = await fetch('users.json?t=' + Date.now(), { cache: 'no-store' });
     if (res.ok) {
@@ -160,7 +160,6 @@ async function initPublicUsersAndBackend() {
     }
   } catch (e) {}
 
-  // 2. Prüfe, ob Netlify Serverless Backend aktiv ist (/.netlify/functions/api)
   try {
     const res = await fetch('/.netlify/functions/api', { method: 'GET' });
     if (res.ok) {
@@ -246,6 +245,7 @@ function normalizeStateObject(raw) {
       lectures: [],
       events: [],
       lectureStatus: {},
+      dayOverrides: {},
       settings: Object.assign({}, DEFAULT_SETTINGS),
       updatedAt: Date.now()
     };
@@ -257,10 +257,14 @@ function normalizeStateObject(raw) {
     cp: s.cp !== undefined ? Number(s.cp) : 6
   }));
 
-  const lectures = (raw.lectures || []).map(l => ({
-    ...l,
-    subjectId: l.subjectId || subjects[0]?.id || ''
-  }));
+  const lectures = (raw.lectures || []).map(l => {
+    const online = isLectureOnline(l);
+    return {
+      ...l,
+      subjectId: l.subjectId || subjects[0]?.id || '',
+      isOnline: online
+    };
+  });
 
   const tasks = (raw.tasks || []).map(t => {
     const tot = Number(t.totalMinutes) || Number(t.remainingMinutes) || 60;
@@ -268,13 +272,15 @@ function normalizeStateObject(raw) {
     const worked = typeof t.workedMinutes === 'number'
       ? t.workedMinutes
       : (t.done ? tot : Math.max(0, tot - rem));
+    const waitWindow = shouldTaskWaitForLeadWindow(t);
     return {
       ...t,
       totalMinutes: tot,
       remainingMinutes: rem,
       workedMinutes: worked,
       relevance: Number(t.relevance) || 3,
-      notBefore: t.notBefore || ''
+      notBefore: t.notBefore || '',
+      waitForLeadWindow: waitWindow
     };
   });
 
@@ -285,9 +291,31 @@ function normalizeStateObject(raw) {
     lectures,
     events: raw.events || [],
     lectureStatus: raw.lectureStatus || {},
+    dayOverrides: raw.dayOverrides || {},
     settings: Object.assign({}, DEFAULT_SETTINGS, raw.settings || {}),
     updatedAt: raw.updatedAt || Date.now()
   };
+}
+
+function getDayOverride(dateStr) {
+  S.dayOverrides = S.dayOverrides || {};
+  if (!S.dayOverrides[dateStr]) {
+    S.dayOverrides[dateStr] = {
+      isDayOff: false,
+      maxStudyMin: null,
+      lunchDurationMin: null,
+      lunchStartMin: null,
+      studyBreakMin: null,
+      bufferOverrides: {},
+      breakOverrides: {},
+      freeBlocks: []
+    };
+  }
+  const d = S.dayOverrides[dateStr];
+  d.bufferOverrides = d.bufferOverrides || {};
+  d.breakOverrides = d.breakOverrides || {};
+  d.freeBlocks = Array.isArray(d.freeBlocks) ? d.freeBlocks : [];
+  return d;
 }
 
 function loadStateForCurrentUser() {
@@ -344,31 +372,6 @@ function getCloudEndpoint() {
   return `${base}/uni_planner_users/${userClean}_${SESSION.passHash.slice(0, 16)}.json`;
 }
 
-async function pullFromCloudIfConfigured(showFeedback = false) {
-  const url = getCloudEndpoint();
-  if (!url) return false;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    if (data && typeof data === 'object') {
-      S = normalizeStateObject(data);
-      saveState(true);
-      UI.cloudStatusMsg = '☁️ Synchronisiert';
-      if (showFeedback) showToast('☁️ Plan aus der Cloud geladen!');
-      render();
-      return true;
-    } else if (data === null) {
-      await pushToCloudIfConfigured(true);
-      return true;
-    }
-  } catch (err) {
-    UI.cloudStatusMsg = '⚠️ Cloud-Fehler';
-    if (showFeedback) showToast('Cloud-Abruf fehlgeschlagen: ' + err.message);
-  }
-  return false;
-}
-
 let cloudPushTimer = null;
 function pushToCloudIfConfigured(immediate = false) {
   const url = getCloudEndpoint();
@@ -401,14 +404,14 @@ function showToast(msg) {
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 3000);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
 }
 
 function getSubject(subjectId) {
   return S.subjects.find(s => s.id === subjectId) || S.subjects[0] || { id: '', name: 'Kein Fach', color: '#64748b', baseRank: 1, cp: 6 };
 }
 
-/* --- Vereinheitlichtes Login-Fenster (funktioniert sofort auf Mac & Handy!) --- */
+/* --- Vereinheitlichtes Login-Fenster --- */
 
 function renderLoginScreen() {
   const isDark = getTheme() === 'dark';
@@ -552,6 +555,7 @@ function render() {
     </main>
 
     ${UI.progressModalTaskId ? renderProgressModal() : ''}
+    ${UI.editModal ? renderEditModal() : ''}
   `;
 }
 
@@ -656,11 +660,18 @@ function renderPlanView(plan) {
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0;font-size:17.5px">🗓️ Automatischer Lern- & Terminplan (${plan.horizonDays} Tage)</h2>
-          <span style="font-size:12px;color:var(--mu)">Tippe auf einen Tag, um oben dessen Prioritäten zu sehen · Vorlesungen können als „✓ Besucht“ oder „🚫 Gehe ich nicht hin“ markiert werden</span>
+          <span style="font-size:12px;color:var(--mu)">
+            💡 Klicke direkt auf eine <b>🚶 Wegezeit</b> oder <b>🍽️/☕ Pause</b> zum Löschen/Verkürzen/Verlängern · Mit <b>🌴 Block freihalten</b> oder <b>🌴 Tag frei</b> hältst du Freizeit frei!
+          </span>
         </div>
-        <button class="btn btn-primary" data-action="tab" data-tab="tasks">
-          ➕ Neue Aufgabe eintragen
-        </button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-teal" data-action="weekend-free-toggle" title="Samstag & Sonntag im Plan als frei oder halbes Pensum einstellen">
+            🌴 Wochenende frei / anpassen
+          </button>
+          <button class="btn btn-primary" data-action="tab" data-tab="tasks">
+            ➕ Neue Aufgabe eintragen
+          </button>
+        </div>
       </div>
 
       <div class="schedule-scroll">
@@ -670,71 +681,53 @@ function renderPlanView(plan) {
   `;
 }
 
-function renderTaskCardCompact(t) {
-  const todayStr = toDateStr(new Date());
-  const subj = getSubject(t.subjectId);
-  const doneMin = Number(t.workedMinutes) || 0;
-  const totalMin = Math.max(t.totalMinutes || 60, doneMin + t.remainingMinutes);
-  const pct = totalMin ? Math.min(100, Math.round((doneMin / totalMin) * 100)) : 0;
-  const elig = isTaskEligibleOnDate(t, todayStr, S);
-
-  return `
-    <div class="task-card" style="--sc:${subj.color}">
-      <div class="task-row1">
-        <div class="task-title">${esc(t.title)}</div>
-        <span class="badge">${formatDuration(t.remainingMinutes)} offen</span>
-      </div>
-      <div class="task-badges">
-        <span class="badge badge-subj" style="--sc:${subj.color}"><i></i>${esc(subj.name)}</span>
-        <span class="badge">⭐ Rel: <b>${t.relevance || 3}/5</b></span>
-        ${t.due ? `<span class="badge">📅 Frist: ${formatDateNice(t.due)}</span>` : ''}
-        ${t.isTestPrep ? `<span class="badge" style="color:var(--warn)">🎯 Prüfungsvorbereitung</span>` : ''}
-        ${!elig.eligible ? `<span class="badge" style="color:var(--warn);border-color:var(--warn)">⏸ ${esc(elig.reason)}</span>` : ''}
-      </div>
-
-      <div class="task-rel-row">
-        <label>Relevanz:</label>
-        <select data-action="task-rel-change" data-id="${t.id}">
-          ${[1, 2, 3, 4, 5].map(r => `<option value="${r}" ${(Number(t.relevance) || 3) === r ? 'selected' : ''}>${RELEVANCE_LABELS[r]}</option>`).join('')}
-        </select>
-      </div>
-
-      ${doneMin > 0 ? `
-        <div class="progress-wrap" title="${pct}% erledigt (${formatDuration(doneMin)} bereits für ${subj.name} verbucht)">
-          <div class="progress-bar" style="width:${pct}%;--sc:${subj.color}"></div>
-        </div>
-      ` : ''}
-
-      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:2px">
-        <button class="btn btn-sm btn-ok" data-action="task-done" data-id="${t.id}">✓ Fertig</button>
-        <button class="btn btn-sm btn-warn" data-action="task-partial" data-id="${t.id}">⏱ Restzeit</button>
-        <button class="btn btn-sm" data-action="task-postpone-day" data-id="${t.id}">⏭ Später (+1T)</button>
-        <button class="btn btn-sm" data-action="task-postpone-week" data-id="${t.id}">📅 Nächste Woche</button>
-        ${t.notBefore ? `<button class="btn btn-sm" data-action="task-unpostpone" data-id="${t.id}">▶ Jetzt</button>` : ''}
-        <button class="btn btn-sm btn-danger" data-action="task-del" data-id="${t.id}">🗑</button>
-      </div>
-    </div>
-  `;
-}
-
 function renderDayColumn(day) {
   const isSelected = UI.selectedDayStr === day.dateStr;
   const top3 = day.rankedSubjects.slice(0, 3);
+  const dayOvr = (S.dayOverrides && S.dayOverrides[day.dateStr]) || {};
+  const hasCustomMax = dayOvr.maxStudyMin !== undefined && dayOvr.maxStudyMin !== null && dayOvr.maxStudyMin !== '';
 
   return `
     <div class="day-col ${day.isToday ? 'is-today' : ''} ${day.isCrunch ? 'is-crunch' : ''}"
          style="${isSelected ? 'outline:2px solid var(--ac);outline-offset:1px' : ''}"
          data-action="select-day" data-date="${day.dateStr}">
       <div class="day-head">
-        <div>
-          <div class="day-title">
-            <span>${formatDateNice(day.dateStr)}</span>
-            ${day.isToday ? `<span class="today-badge">Heute</span>` : ''}
-            ${day.isCrunch ? `<span class="crunch-badge">⚡ Ausnahme bis ≤23h</span>` : ''}
+        <div class="day-head-top">
+          <div>
+            <div class="day-title">
+              <span>${formatDateNice(day.dateStr)}</span>
+              ${day.isToday ? `<span class="today-badge">Heute</span>` : ''}
+              ${day.isDayOff ? `<span class="badge" style="background:var(--teal);color:#fff;border:none">🌴 Frei</span>` : ''}
+              ${hasCustomMax && !day.isDayOff ? `<span class="badge" style="color:var(--teal);border-color:var(--teal)">Max. ${formatDuration(dayOvr.maxStudyMin)}</span>` : ''}
+              ${day.isCrunch ? `<span class="crunch-badge">⚡ Ausnahme bis ≤23h</span>` : ''}
+            </div>
+            <div class="day-meta">
+              ${day.allDayBlocked
+                ? 'Ganztägig blockiert / Urlaub'
+                : day.isDayOff
+                  ? 'Freier Tag (0 Min. Lernzeit)'
+                  : `Geplante Lernzeit: <b>${formatDuration(day.studyMinutesPlanned)}</b>`}
+            </div>
           </div>
-          <div class="day-meta">
-            ${day.allDayBlocked ? 'Ganztägig blockiert / Urlaub' : `Geplante Lernzeit: <b>${formatDuration(day.studyMinutesPlanned)}</b>`}
-          </div>
+        </div>
+
+        <!-- Schnell-Leiste für Freizeit, Tagespensum & Pausen an diesem Tag -->
+        <div class="day-quick-bar">
+          <button class="btn btn-xs ${day.isDayOff ? 'btn-teal' : ''}"
+                  data-action="day-toggle-off" data-date="${day.dateStr}"
+                  title="Diesen kompletten Tag von Lernblöcken freihalten">
+            ${day.isDayOff ? '↩ Tag wieder planen' : '🌴 Tag frei'}
+          </button>
+          <button class="btn btn-xs"
+                  data-action="open-day-modal" data-date="${day.dateStr}" data-focus="freeblock"
+                  title="Einen bestimmten Zeitraum an diesem Tag als Freizeit blockieren">
+            ➕ Block frei
+          </button>
+          <button class="btn btn-xs ${hasCustomMax ? 'btn-teal' : ''}"
+                  data-action="open-day-modal" data-date="${day.dateStr}" data-focus="limits"
+                  title="Tagespensum (weniger machen), Mittagspause & Pausen für diesen Tag anpassen">
+            ⚙️ Pensum & Pause
+          </button>
         </div>
       </div>
 
@@ -754,23 +747,28 @@ function renderDayColumn(day) {
           ${day.skippedLecturesToday.map(sk => `
             <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
               <span>🚫 <s>${esc(sk.title)} (${sk.start}–${sk.end})</s></span>
-              <button class="btn btn-sm" style="padding:2px 7px;font-size:11px" data-action="lec-restore" data-lecid="${sk.lectureId}" data-date="${sk.dateStr}">↩ Hingehen</button>
+              <button class="btn btn-xs" data-action="lec-restore" data-lecid="${sk.lectureId}" data-date="${sk.dateStr}">↩ Hingehen</button>
             </div>
           `).join('')}
         </div>
       ` : ''}
 
       <div class="day-slots">
-        ${day.timeline.length === 0 ? `<div class="empty-box" style="padding:16px">Freier Tag – keine Termine oder offenen Aufgaben</div>` : day.timeline.map(slot => renderSlotItem(slot, day)).join('')}
+        ${day.timeline.length === 0
+          ? `<div class="empty-box" style="padding:16px">Freier Tag – keine Termine oder offenen Aufgaben</div>`
+          : day.timeline.map(slot => renderSlotItem(slot, day)).join('')}
       </div>
     </div>
   `;
 }
 
 function renderSlotItem(slot, day) {
-  const timeRange = slot.allDay ? 'Ganztägig' : (slot.isSubmissionDeadline ? `Bis ${minToTime(slot.startMin)} Uhr` : `${minToTime(slot.startMin)} – ${minToTime(slot.endMin)}`);
+  const timeRange = slot.allDay
+    ? 'Ganztägig'
+    : (slot.isSubmissionDeadline ? `Bis ${minToTime(slot.startMin)} Uhr` : `${minToTime(slot.startMin)} – ${minToTime(slot.endMin)}`);
   const durText = (slot.allDay || slot.isSubmissionDeadline) ? '' : `${slot.endMin - slot.startMin} Min.`;
 
+  // 1. Lernblock (Study)
   if (slot.type === 'study') {
     return `
       <div class="slot type-study" style="--sl-c:${slot.color}">
@@ -778,7 +776,10 @@ function renderSlotItem(slot, day) {
           <span class="slot-time">📖 ${timeRange} (${durText})</span>
           <span style="font-weight:700;color:${slot.color}">${esc(slot.subjectName)} ${slot.isBoosted ? '🔥' : ''}</span>
         </div>
-        <div class="slot-title">${esc(slot.title)}</div>
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px">
+          <div class="slot-title">${esc(slot.title)}</div>
+          <button class="btn btn-xs" data-action="edit-task" data-id="${slot.taskId}" title="Aufgabe bearbeiten">✏️</button>
+        </div>
         <div class="slot-sub">
           Prio: ${slot.priorityScore} (Rel ${slot.taskRelevance || 3}/5)${slot.remainingAfterBlock > 0 ? ` · Danach noch ${formatDuration(slot.remainingAfterBlock)} übrig` : ' · Wird hier fertig'}
         </div>
@@ -792,6 +793,14 @@ function renderSlotItem(slot, day) {
           <button class="btn btn-sm btn-warn" data-action="task-partial" data-id="${slot.taskId}">
             ⏱ Restzeit
           </button>
+          <button class="btn btn-sm btn-teal"
+                  data-action="slot-keep-free"
+                  data-date="${day.dateStr}"
+                  data-start="${slot.startMin}"
+                  data-end="${slot.endMin}"
+                  title="Diesen Zeitblock (${timeRange}) als Freizeit freihalten">
+            🌴 Block frei
+          </button>
           <button class="btn btn-sm" data-action="slot-postpone-day" data-id="${slot.taskId}" data-date="${day.dateStr}">
             ⏭ Später
           </button>
@@ -803,16 +812,20 @@ function renderSlotItem(slot, day) {
     `;
   }
 
+  // 2. Vorlesung (Lecture)
   if (slot.type === 'lecture') {
     const isAttended = slot.attendanceStatus === 'attended';
     const hrsStr = formatHoursDecimal(slot.durationMin);
     return `
       <div class="slot type-lecture" style="border-left-color:${slot.color || '#64748b'};${isAttended ? 'background:var(--ok-soft);border-color:var(--ok)' : ''}">
         <div class="slot-top">
-          <span class="slot-time">🏛️ ${timeRange} (${durText})</span>
+          <span class="slot-time">${slot.isOnline ? '💻' : '🏛️'} ${timeRange} (${durText})</span>
           <span style="font-weight:700;color:${slot.color || 'var(--mu)'}">${esc(slot.subjectName || 'Vorlesung')}</span>
         </div>
-        <div class="slot-title">${esc(slot.title)}</div>
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px">
+          <div class="slot-title">${esc(slot.title)}</div>
+          <button class="btn btn-xs" data-action="edit-lecture" data-id="${slot.lectureId}" title="Vorlesung & Wegezeit bearbeiten">✏️</button>
+        </div>
         <div class="slot-sub">${esc(slot.subtitle || 'Vorlesung')}</div>
         <div class="slot-actions">
           <button class="btn btn-sm ${isAttended ? 'btn-ok' : ''}"
@@ -833,12 +846,16 @@ function renderSlotItem(slot, day) {
     `;
   }
 
+  // 3. Prüfung / Abgabe (Test)
   if (slot.type === 'test') {
     return `
       <div class="slot type-test" style="--sl-c:${slot.color || '#ef4444'}">
         <div class="slot-top">
           <span class="slot-time">🎯 ${timeRange}</span>
-          <span>${slot.isSubmissionDeadline ? 'ABGABEFRIST' : 'PRÜFUNG'}</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span>${slot.isSubmissionDeadline ? 'ABGABEFRIST' : 'PRÜFUNG'}</span>
+            ${slot.testId ? `<button class="btn btn-xs" data-action="edit-test" data-id="${slot.testId}" title="Prüfung bearbeiten">✏️</button>` : ''}
+          </div>
         </div>
         <div class="slot-title">${esc(slot.title)}</div>
         <div class="slot-sub">${esc(slot.subtitle || '')}</div>
@@ -846,12 +863,45 @@ function renderSlotItem(slot, day) {
     `;
   }
 
+  // 4. Manuell freigehaltener Freizeit-Block ("🌴 Block freihalten" / "🌴 Tag frei")
+  if (slot.type === 'freeblock') {
+    if (slot.isFullDayOffBanner) {
+      return `
+        <div class="slot type-freeblock">
+          <div class="slot-top">
+            <span class="slot-time">🌴 Ganztägig frei</span>
+            <button class="btn btn-xs" data-action="day-toggle-off" data-date="${day.dateStr}">↩ Aufheben</button>
+          </div>
+          <div class="slot-title">${esc(slot.title)}</div>
+          <div class="slot-sub">${esc(slot.subtitle)}</div>
+        </div>
+      `;
+    }
+    return `
+      <div class="slot type-freeblock">
+        <div class="slot-top">
+          <span class="slot-time">🌴 ${timeRange} (${durText})</span>
+          <div style="display:flex;gap:4px">
+            <button class="btn btn-xs" data-action="open-day-modal" data-date="${day.dateStr}" data-focus="freeblock" title="Freizeit-Blöcke bearbeiten">✏️</button>
+            <button class="btn btn-xs btn-danger" data-action="del-freeblock" data-date="${day.dateStr}" data-fbid="${slot.freeBlockId}" title="Freigabe aufheben">✕</button>
+          </div>
+        </div>
+        <div class="slot-title">${esc(slot.title)}</div>
+        <div class="slot-sub">Freigehaltener Block – keine Aufgaben in dieser Zeit</div>
+      </div>
+    `;
+  }
+
+  // 5. Außer-Haus-Termin (Event)
   if (slot.type === 'event') {
     return `
       <div class="slot type-event">
         <div class="slot-top">
           <span class="slot-time">🏖️ ${timeRange}</span>
-          <span>${durText}</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span>${durText}</span>
+            ${slot.eventId ? `<button class="btn btn-xs" data-action="edit-event" data-id="${slot.eventId}" title="Termin bearbeiten">✏️</button>` : ''}
+          </div>
         </div>
         <div class="slot-title">${esc(slot.title)}</div>
         <div class="slot-sub">${esc(slot.subtitle || 'Außer-Haus')}</div>
@@ -859,22 +909,66 @@ function renderSlotItem(slot, day) {
     `;
   }
 
-  if (slot.type === 'meal' || slot.type === 'break') {
-    const icon = slot.type === 'meal' ? '🍽️' : '☕';
+  // 6. Essens- & Nachmittagspause (Meal) -> anklickbar + Direkt-Buttons zum Löschen/Verkürzen/Verlängern!
+  if (slot.type === 'meal') {
+    const curDur = slot.endMin - slot.startMin;
     return `
-      <div class="slot type-${slot.type}">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <span>${icon} <b>${timeRange}</b> · ${esc(slot.title)}</span>
+      <div class="slot type-meal slot-clickable"
+           data-action="open-day-modal" data-date="${day.dateStr}" data-focus="lunch"
+           title="Klicken, um die Mittagspause für diesen Tag anzupassen oder zu löschen">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap">
+          <span>🍽️ <b>${timeRange}</b> · ${esc(slot.title)} (${curDur}m)</span>
+          <div style="display:flex;gap:4px" onclick="event.stopPropagation()">
+            <button class="btn btn-xs" data-action="lunch-adjust" data-date="${day.dateStr}" data-delta="-15" title="15 Min. kürzer">-15m</button>
+            <button class="btn btn-xs" data-action="lunch-adjust" data-date="${day.dateStr}" data-delta="15" title="15 Min. länger">+15m</button>
+            <button class="btn btn-xs btn-danger" data-action="lunch-delete" data-date="${day.dateStr}" title="Mittagspause heute streichen">✕</button>
+          </div>
         </div>
       </div>
     `;
   }
 
-  if (slot.type === 'buffer') {
+  // 7. Erholungspause zwischen Lernblöcken (Break) -> anklickbar + Direkt-Buttons!
+  if (slot.type === 'break') {
+    const curDur = slot.endMin - slot.startMin;
     return `
-      <div class="slot type-buffer">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <span>🚶 ${timeRange} · ${esc(slot.title)}</span>
+      <div class="slot type-break slot-clickable"
+           data-action="open-break-modal"
+           data-date="${day.dateStr}"
+           data-bkey="${slot.breakKey}"
+           data-cur="${curDur}"
+           title="Klicken, um diese Pause zu löschen, zu verkürzen oder zu verlängern">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap">
+          <span>☕ <b>${timeRange}</b> · Erholungspause (${curDur}m)</span>
+          <div style="display:flex;gap:4px" onclick="event.stopPropagation()">
+            <button class="btn btn-xs" data-action="break-adjust" data-date="${day.dateStr}" data-bkey="${slot.breakKey}" data-cur="${curDur}" data-delta="-5" title="5 Min. kürzer">-5m</button>
+            <button class="btn btn-xs" data-action="break-adjust" data-date="${day.dateStr}" data-bkey="${slot.breakKey}" data-cur="${curDur}" data-delta="5" title="5 Min. länger">+5m</button>
+            <button class="btn btn-xs btn-danger" data-action="break-delete" data-date="${day.dateStr}" data-bkey="${slot.breakKey}" title="Diese Pause löschen (direkt weiterlernen)">✕</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 8. Wegezeit / Gebäudewechsel (Buffer) -> anklickbar + Direkt-Buttons zum Löschen/Verkürzen/Verlängern!
+  if (slot.type === 'buffer') {
+    const curDur = slot.endMin - slot.startMin;
+    return `
+      <div class="slot type-buffer slot-clickable"
+           data-action="open-buffer-modal"
+           data-date="${day.dateStr}"
+           data-bufkey="${slot.bufferKey}"
+           data-lecid="${slot.lectureId || ''}"
+           data-pos="${slot.position || ''}"
+           data-cur="${slot.configuredMin || curDur}"
+           title="Klicken, um diese Wegezeit zu löschen (z.B. wenn du in der Uni bleibst oder online bist), zu verkürzen oder zu verlängern">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap">
+          <span>🚶 <b>${timeRange}</b> · ${esc(slot.title)} (${curDur}m)</span>
+          <div style="display:flex;gap:4px" onclick="event.stopPropagation()">
+            <button class="btn btn-xs" data-action="buffer-adjust" data-date="${day.dateStr}" data-bufkey="${slot.bufferKey}" data-cur="${slot.configuredMin || curDur}" data-delta="-10" title="Wegezeit 10 Min. kürzer">-10m</button>
+            <button class="btn btn-xs" data-action="buffer-adjust" data-date="${day.dateStr}" data-bufkey="${slot.bufferKey}" data-cur="${slot.configuredMin || curDur}" data-delta="10" title="Wegezeit 10 Min. länger">+10m</button>
+            <button class="btn btn-xs btn-danger" data-action="buffer-delete" data-date="${day.dateStr}" data-bufkey="${slot.bufferKey}" title="Wegezeit löschen (0 Min.)">✕</button>
+          </div>
         </div>
       </div>
     `;
@@ -887,7 +981,9 @@ function renderSlotItem(slot, day) {
 
 function renderTasksView() {
   const todayStr = toDateStr(new Date());
-  const openTasks = S.tasks.filter(t => !t.done && (UI.filterSubjectId === 'all' || t.subjectId === UI.filterSubjectId));
+  const openTasks = S.tasks
+    .filter(t => !t.done && (UI.filterSubjectId === 'all' || t.subjectId === UI.filterSubjectId))
+    .sort((a, b) => (Number(b.relevance) || 3) - (Number(a.relevance) || 3));
   const doneTasks = S.tasks.filter(t => t.done && (UI.filterSubjectId === 'all' || t.subjectId === UI.filterSubjectId));
 
   return `
@@ -919,13 +1015,13 @@ function renderTasksView() {
               </div>
             </div>
             <div>
-              <label>Relevanz dieser Aufgabe</label>
+              <label>Relevanz / Priorität dieser Aufgabe (5 = Sehr wichtig wird zuerst eingeplant!)</label>
               <select name="relevance">
-                <option value="1">1 – Sehr gering</option>
-                <option value="2">2 – Eher gering</option>
-                <option value="3" selected>3 – Normal</option>
+                <option value="1">1 – Sehr gering (ganz am Ende)</option>
+                <option value="2">2 – Eher gering (z.B. Skript lesen)</option>
+                <option value="3" selected>3 – Normal (Standard-Aufgabe)</option>
                 <option value="4">4 – Wichtig</option>
-                <option value="5">5 – Sehr wichtig</option>
+                <option value="5">5 – Sehr wichtig (höchste Priorität!)</option>
               </select>
             </div>
             <div class="form-grid">
@@ -935,11 +1031,17 @@ function renderTasksView() {
               </div>
               <div>
                 <label>Gehört zu Test/Klausur (optional)</label>
-                <select name="testId">
-                  <option value="">– Allgemeine Aufgabe –</option>
+                <select name="testId" id="new-task-testid-sel">
+                  <option value="">– Allgemeine Aufgabe (sofort einplanen) –</option>
                   ${S.tests.filter(t => t.date >= todayStr).map(t => `<option value="${t.id}">${esc(t.title)} (${formatDateNice(t.date)})</option>`).join('')}
                 </select>
               </div>
+            </div>
+            <div id="new-task-wait-wrap" style="display:none;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg);border:1px solid var(--ln)">
+              <input type="checkbox" id="new-task-wait-chk" name="waitForLeadWindow" style="width:16px;height:16px">
+              <label for="new-task-wait-chk" style="margin:0;cursor:pointer;color:var(--tx);font-weight:500">
+                Erst kurz vor der Prüfung im Vorbereitungs-Fenster starten (nicht sofort einplanen)
+              </label>
             </div>
             <button type="submit" class="btn btn-primary" style="width:100%">Aufgabe speichern & in den Plan einrechnen</button>
           </form>
@@ -973,6 +1075,7 @@ function renderTasksView() {
                   <div class="task-row1">
                     <div class="task-title">${esc(t.title)}</div>
                     <div style="display:flex;gap:6px">
+                      <button class="btn btn-sm" data-action="edit-task" data-id="${t.id}">✏️ Bearbeiten</button>
                       <button class="btn btn-sm" data-action="task-reopen" data-id="${t.id}">↩ Wieder öffnen</button>
                       <button class="btn btn-sm btn-danger" data-action="task-del" data-id="${t.id}">🗑</button>
                     </div>
@@ -987,6 +1090,58 @@ function renderTasksView() {
           </div>
         `}
       </section>
+    </div>
+  `;
+}
+
+function renderTaskCardCompact(t) {
+  const todayStr = toDateStr(new Date());
+  const subj = getSubject(t.subjectId);
+  const doneMin = Number(t.workedMinutes) || 0;
+  const totalMin = Math.max(t.totalMinutes || 60, doneMin + t.remainingMinutes);
+  const pct = totalMin ? Math.min(100, Math.round((doneMin / totalMin) * 100)) : 0;
+  const elig = isTaskEligibleOnDate(t, todayStr, S);
+
+  return `
+    <div class="task-card" style="--sc:${subj.color}">
+      <div class="task-row1">
+        <div class="task-title">${esc(t.title)}</div>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span class="badge">${formatDuration(t.remainingMinutes)} offen</span>
+          <button class="btn btn-sm" data-action="edit-task" data-id="${t.id}" title="Aufgabe bearbeiten">✏️ Bearbeiten</button>
+        </div>
+      </div>
+      <div class="task-badges">
+        <span class="badge badge-subj" style="--sc:${subj.color}"><i></i>${esc(subj.name)}</span>
+        <span class="badge">⭐ Rel: <b>${t.relevance || 3}/5</b></span>
+        ${t.due ? `<span class="badge">📅 Frist: ${formatDateNice(t.due)}</span>` : ''}
+        ${!elig.eligible ? `
+          <span class="badge" style="color:var(--warn);border-color:var(--warn)">⏸ ${esc(elig.reason)}</span>
+          ${elig.isLeadDeferred ? `<button class="btn btn-xs btn-primary" data-action="task-force-active" data-id="${t.id}">▶ Sofort einplanen</button>` : ''}
+        ` : `<span class="badge" style="color:var(--ok)">✓ Aktiv im Plan</span>`}
+      </div>
+
+      <div class="task-rel-row">
+        <label>Priorität / Relevanz:</label>
+        <select data-action="task-rel-change" data-id="${t.id}">
+          ${[1, 2, 3, 4, 5].map(r => `<option value="${r}" ${(Number(t.relevance) || 3) === r ? 'selected' : ''}>${RELEVANCE_LABELS[r]}</option>`).join('')}
+        </select>
+      </div>
+
+      ${doneMin > 0 ? `
+        <div class="progress-wrap" title="${pct}% erledigt (${formatDuration(doneMin)} bereits für ${subj.name} verbucht)">
+          <div class="progress-bar" style="width:${pct}%;--sc:${subj.color}"></div>
+        </div>
+      ` : ''}
+
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:2px">
+        <button class="btn btn-sm btn-ok" data-action="task-done" data-id="${t.id}">✓ Fertig</button>
+        <button class="btn btn-sm btn-warn" data-action="task-partial" data-id="${t.id}">⏱ Restzeit</button>
+        <button class="btn btn-sm" data-action="task-postpone-day" data-id="${t.id}">⏭ Später (+1T)</button>
+        <button class="btn btn-sm" data-action="task-postpone-week" data-id="${t.id}">📅 Nächste Woche</button>
+        ${t.notBefore ? `<button class="btn btn-sm" data-action="task-unpostpone" data-id="${t.id}">▶ Jetzt</button>` : ''}
+        <button class="btn btn-sm btn-danger" data-action="task-del" data-id="${t.id}">🗑</button>
+      </div>
     </div>
   `;
 }
@@ -1045,7 +1200,8 @@ function renderSubjectsView() {
                     <b style="font-size:15.5px">${esc(s.name)}</b>
                   </div>
 
-                  <div style="display:flex;align-items:center;gap:6px">
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <button class="btn btn-sm" data-action="edit-subject" data-id="${s.id}">✏️ Bearbeiten</button>
                     <button class="btn btn-sm" data-action="subj-up" data-id="${s.id}" ${idx === 0 ? 'disabled' : ''}>↑ Höher</button>
                     <button class="btn btn-sm" data-action="subj-down" data-id="${s.id}" ${idx === sortedSubjects.length - 1 ? 'disabled' : ''}>↓ Tiefer</button>
                     <button class="btn btn-sm btn-danger" data-action="subj-del" data-id="${s.id}" title="Fach löschen">🗑</button>
@@ -1184,6 +1340,9 @@ function renderTestsView() {
               const startPrepDate = addDays(t.date, -leadDays);
               const dLabel = dLeft < 0 ? `Vor ${Math.abs(dLeft)} Tag(en)` : dLeft === 0 ? 'HEUTE!' : dLeft === 1 ? 'MORGEN!' : `In ${dLeft} Tagen`;
 
+              const linkedPrepTask = S.tasks.find(x => x.testId === t.id && shouldTaskWaitForLeadWindow(x));
+              const prepMinRemaining = linkedPrepTask ? linkedPrepTask.remainingMinutes : 0;
+
               const typeBadge = t.type === 'exam'
                 ? `<span class="badge" style="background:var(--rd);color:#fff;border:none">KLAUSUR</span>`
                 : t.type === 'bonus_submission'
@@ -1197,13 +1356,17 @@ function renderTestsView() {
                       ${typeBadge}
                       <b style="margin-left:6px;font-size:14.5px">${esc(t.title)}</b>
                     </div>
-                    <button class="btn btn-sm btn-danger" data-action="test-del" data-id="${t.id}">🗑 Löschen</button>
+                    <div style="display:flex;gap:6px">
+                      <button class="btn btn-sm" data-action="edit-test" data-id="${t.id}">✏️ Bearbeiten</button>
+                      <button class="btn btn-sm btn-danger" data-action="test-del" data-id="${t.id}">🗑</button>
+                    </div>
                   </div>
                   <div class="task-badges">
                     <span class="badge badge-subj" style="--sc:${subj.color}"><i></i>${esc(subj.name)}</span>
                     <span class="badge">📅 ${formatDateLong(t.date)} · ${esc(t.start || '10:00')} Uhr (${dLabel})</span>
                     <span class="badge">⚡ Relevanz: <b>${t.relevance}/5</b></span>
                     <span class="badge">🧠 Schwierigkeit: <b>${t.difficulty}/5</b></span>
+                    ${prepMinRemaining > 0 ? `<span class="badge">⏱ Aufwand offen: <b>${formatDuration(prepMinRemaining)}</b></span>` : ''}
                   </div>
                   <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:4px;font-size:12px">
                     <div>
@@ -1273,9 +1436,15 @@ function renderScheduleView() {
                 <input type="time" name="end" value="11:15" required>
               </div>
               <div>
-                <label>Raum / Gebäude (optional)</label>
-                <input type="text" name="room" placeholder="Raum">
+                <label>Raum / Ort (optional)</label>
+                <input type="text" name="room" placeholder="Raum oder Online">
               </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg);border:1px solid var(--ln)">
+              <input type="checkbox" id="lec-online-chk" name="isOnline" style="width:17px;height:17px">
+              <label for="lec-online-chk" style="margin:0;cursor:pointer;color:var(--tx);font-weight:600">
+                💻 Online-Veranstaltung / Keine Wegezeit nötig (0 Min. vor & nach Termin)
+              </label>
             </div>
             <button type="submit" class="btn btn-primary">+ Vorlesung hinzufügen</button>
           </form>
@@ -1284,21 +1453,28 @@ function renderScheduleView() {
         <div class="task-list">
           ${sortedLectures.length === 0 ? `<div class="empty-box">Noch keine Vorlesungen eingetragen.</div>` : sortedLectures.map(l => {
             const subj = getSubject(l.subjectId);
+            const online = isLectureOnline(l);
+            const tBefore = online ? 0 : (l.transitBeforeMin ?? S.settings.transitBufferMin ?? 20);
+            const tAfter  = online ? 0 : (l.transitAfterMin ?? S.settings.transitBufferMin ?? 20);
             return `
-              <div class="subj-item" style="--sc:${subj.color}">
-                <div style="display:flex;flex-direction:column;gap:4px">
+              <div class="subj-item" style="--sc:${subj.color};flex-wrap:wrap">
+                <div style="display:flex;flex-direction:column;gap:4px;min-width:0">
                   <div>
                     <b>${WEEKDAY_SHORT[l.weekday]} · ${esc(l.start)} – ${esc(l.end)} Uhr</b>: ${esc(l.title)}
                     ${l.room ? `<span style="color:var(--mu);font-size:12.5px"> (${esc(l.room)})</span>` : ''}
                   </div>
-                  <div style="display:flex;align-items:center;gap:6px">
-                    <span style="font-size:12px;color:var(--mu)">Fach:</span>
-                    <select data-action="lec-subj-change" data-id="${l.id}" style="width:auto;padding:2px 8px;font-size:12px">
-                      ${S.subjects.map(s => `<option value="${s.id}" ${s.id === l.subjectId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
-                    </select>
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <span class="badge badge-subj" style="--sc:${subj.color}"><i></i>${esc(subj.name)}</span>
+                    ${online
+                      ? `<span class="badge" style="color:var(--teal);border-color:var(--teal)">💻 Online (keine Wegezeit)</span>`
+                      : `<span class="badge">🚶 Wegezeit: ${tBefore}m vorher / ${tAfter}m nachher</span>`
+                    }
                   </div>
                 </div>
-                <button class="btn btn-sm btn-danger" data-action="lec-del" data-id="${l.id}">🗑</button>
+                <div style="display:flex;gap:6px;align-items:center">
+                  <button class="btn btn-sm" data-action="edit-lecture" data-id="${l.id}">✏️ Bearbeiten</button>
+                  <button class="btn btn-sm btn-danger" data-action="lec-del" data-id="${l.id}">🗑</button>
+                </div>
               </div>
             `;
           }).join('')}
@@ -1338,7 +1514,11 @@ function renderScheduleView() {
               <input type="time" name="end" value="19:30">
             </div>
           </div>
-          <button type="submit" class="btn btn-primary">+ Außer-Haus-Termin eintragen</button>
+          <div style="display:flex;align-items:center;gap:8px;margin:2px 0">
+            <input type="checkbox" id="ev-notransit-chk" name="noTransit" style="width:17px;height:17px">
+            <label for="ev-notransit-chk" style="margin:0;cursor:pointer;color:var(--tx)">Ohne Wegezeit (zuhause / Freizeitblock)</label>
+          </div>
+          <button type="submit" class="btn btn-primary">+ Termin eintragen</button>
         </form>
 
         <div class="task-list">
@@ -1349,9 +1529,13 @@ function renderScheduleView() {
                 <span style="font-size:12.5px;color:var(--mu)">
                   ${formatDateNice(ev.startDate)}${ev.endDate && ev.endDate !== ev.startDate ? ' bis ' + formatDateNice(ev.endDate) : ''}
                   · ${ev.allDay ? 'Ganztägig' : `${esc(ev.start)} – ${esc(ev.end)} Uhr`}
+                  ${ev.needsTransit === false ? ' · (ohne Wegezeit)' : ''}
                 </span>
               </div>
-              <button class="btn btn-sm btn-danger" data-action="ev-del" data-id="${ev.id}">🗑</button>
+              <div style="display:flex;gap:6px">
+                <button class="btn btn-sm" data-action="edit-event" data-id="${ev.id}">✏️ Bearbeiten</button>
+                <button class="btn btn-sm btn-danger" data-action="ev-del" data-id="${ev.id}">🗑</button>
+              </div>
             </div>
           `).join('')}
         </div>
@@ -1426,26 +1610,26 @@ function renderSettingsView() {
           <div class="form-grid">
             <div>
               <label>Kurze Pause zwischen Blöcken (Min.)</label>
-              <input type="number" name="minBreakMin" value="${st.minBreakMin}" min="10" max="45" step="5">
+              <input type="number" name="minBreakMin" value="${st.minBreakMin}" min="0" max="45" step="5">
             </div>
             <div>
               <label>Große Pause nach 2 Blöcken (Min.)</label>
-              <input type="number" name="longBreakMin" value="${st.longBreakMin}" min="15" max="60" step="5">
+              <input type="number" name="longBreakMin" value="${st.longBreakMin}" min="0" max="60" step="5">
             </div>
             <div>
-              <label>Wegezeit vor/nach Vorlesung (Min.)</label>
+              <label>Standard-Wegezeit Präsenz-Vorlesung (Min.)</label>
               <input type="number" name="transitBufferMin" value="${st.transitBufferMin}" min="0" max="60" step="5">
             </div>
           </div>
 
           <div class="form-grid">
             <div>
-              <label>Automatische Essens- & Nachmittagspause (Min.)</label>
-              <input type="number" name="afternoonBreakMin" value="${st.afternoonBreakMin}" min="30" max="120" step="15">
+              <label>Standard Essens- & Nachmittagspause (Min.)</label>
+              <input type="number" name="afternoonBreakMin" value="${st.afternoonBreakMin}" min="0" max="120" step="15">
             </div>
             <div>
               <label>Automatische Abendessenspause (Min.)</label>
-              <input type="number" name="dinnerBreakMin" value="${st.dinnerBreakMin}" min="30" max="90" step="15">
+              <input type="number" name="dinnerBreakMin" value="${st.dinnerBreakMin}" min="0" max="90" step="15">
             </div>
             <div>
               <label>Planungs-Horizont (Tage)</label>
@@ -1482,7 +1666,6 @@ function renderSettingsView() {
           </div>
         </section>
 
-        <!-- Accounts verwalten & löschen -->
         <section class="panel">
           <div class="panel-head">
             <h2>👥 Gespeicherte Accounts verwalten (${allAccounts.length})</h2>
@@ -1554,6 +1737,515 @@ function renderProgressModal() {
       </div>
     </div>
   `;
+}
+
+/* --- Universelles Bearbeitungs- & Tages-Anpassungs-Modal (Punkt 2, 3 & 4) --- */
+
+function renderEditModal() {
+  const m = UI.editModal;
+  if (!m) return '';
+
+  // 1. Aufgabe bearbeiten
+  if (m.type === 'task') {
+    const t = S.tasks.find(x => x.id === m.id);
+    if (!t) return '';
+    const waitWin = shouldTaskWaitForLeadWindow(t);
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>✏️ Aufgabe bearbeiten</h3>
+          <form id="edit-task-form" class="form-stack">
+            <input type="hidden" name="id" value="${esc(t.id)}">
+            <div>
+              <label>Titel der Aufgabe</label>
+              <input type="text" name="title" value="${esc(t.title)}" required>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Fach</label>
+                <select name="subjectId">
+                  ${S.subjects.map(s => `<option value="${s.id}" ${s.id === t.subjectId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label>Relevanz / Priorität</label>
+                <select name="relevance">
+                  ${[1, 2, 3, 4, 5].map(r => `<option value="${r}" ${(Number(t.relevance) || 3) === r ? 'selected' : ''}>${RELEVANCE_LABELS[r]}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Offene Restzeit (Minuten)</label>
+                <input type="number" name="remainingMinutes" value="${t.remainingMinutes}" min="0" max="6000" step="5" required>
+              </div>
+              <div>
+                <label>Bereits gearbeitet (Minuten)</label>
+                <input type="number" name="workedMinutes" value="${t.workedMinutes || 0}" min="0" max="6000" step="5">
+              </div>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Frist / Abgabe (optional)</label>
+                <input type="date" name="due" value="${esc(t.due || '')}">
+              </div>
+              <div>
+                <label>Gehört zu Test/Klausur (optional)</label>
+                <select name="testId">
+                  <option value="">– Allgemeine Aufgabe –</option>
+                  ${S.tests.map(x => `<option value="${x.id}" ${x.id === t.testId ? 'selected' : ''}>${esc(x.title)} (${formatDateNice(x.date)})</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg);border:1px solid var(--ln)">
+              <input type="checkbox" id="edit-task-wait-chk" name="waitForLeadWindow" ${waitWin ? 'checked' : ''} style="width:16px;height:16px">
+              <label for="edit-task-wait-chk" style="margin:0;cursor:pointer;color:var(--tx);font-weight:500">
+                Erst kurz vor der verknüpften Prüfung starten (Vorlauffenster abwarten)
+              </label>
+            </div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+              <button type="button" class="btn" data-action="close-modal">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Änderungen speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  // 2. Klausur / Test / Abgabe bearbeiten
+  if (m.type === 'test') {
+    const t = S.tests.find(x => x.id === m.id);
+    if (!t) return '';
+    const linkedPrepTask = S.tasks.find(x => x.testId === t.id && shouldTaskWaitForLeadWindow(x)) || S.tasks.find(x => x.testId === t.id && x.isTestPrep);
+    const prepHours = linkedPrepTask ? Math.round((linkedPrepTask.remainingMinutes / 60) * 10) / 10 : 0;
+    const leadDays = getTestLeadDays(t, S.settings);
+
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>✏️ Klausur / Test / Abgabe bearbeiten</h3>
+          <form id="edit-test-form" class="form-stack">
+            <input type="hidden" name="id" value="${esc(t.id)}">
+            <div class="form-grid">
+              <div>
+                <label>Art</label>
+                <select name="type">
+                  <option value="bonus" ${t.type === 'bonus' ? 'selected' : ''}>Bonuspunkte-Test</option>
+                  <option value="bonus_submission" ${t.type === 'bonus_submission' ? 'selected' : ''}>Wochen-Abgabe (Frist)</option>
+                  <option value="exam" ${t.type === 'exam' ? 'selected' : ''}>Klausur</option>
+                </select>
+              </div>
+              <div>
+                <label>Fach</label>
+                <select name="subjectId">
+                  ${S.subjects.map(s => `<option value="${s.id}" ${s.id === t.subjectId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div>
+              <label>Bezeichnung</label>
+              <input type="text" name="title" value="${esc(t.title)}" required>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Datum</label>
+                <input type="date" name="date" value="${esc(t.date)}" required>
+              </div>
+              <div>
+                <label>Uhrzeit</label>
+                <input type="time" name="start" value="${esc(t.start || '10:00')}" required>
+              </div>
+              <div>
+                <label>Dauer vor Ort (Min.)</label>
+                <input type="number" name="durationMin" value="${t.durationMin ?? 45}" min="0" max="600" step="5">
+              </div>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Relevanz (1–5)</label>
+                <select name="relevance">
+                  ${[1, 2, 3, 4, 5].map(r => `<option value="${r}" ${Number(t.relevance) === r ? 'selected' : ''}>${r}/5</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label>Schwierigkeit (1–5)</label>
+                <select name="difficulty">
+                  ${[1, 2, 3, 4, 5].map(d => `<option value="${d}" ${Number(t.difficulty) === d ? 'selected' : ''}>${d}/5</option>`).join('')}
+                </select>
+              </div>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Offener Vorbereitungsaufwand (Stunden)</label>
+                <input type="number" name="prepHours" value="${prepHours}" min="0" max="300" step="0.5">
+              </div>
+              <div>
+                <label>Vorlaufzeit (Tage vorher starten)</label>
+                <input type="number" name="leadDays" value="${leadDays}" min="1" max="120" step="1">
+              </div>
+            </div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+              <button type="button" class="btn" data-action="close-modal">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Änderungen speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  // 3. Vorlesung bearbeiten (inkl. Online-Status & Wegezeit vor/nachher)
+  if (m.type === 'lecture') {
+    const l = S.lectures.find(x => x.id === m.id);
+    if (!l) return '';
+    const online = isLectureOnline(l);
+    const defTransit = S.settings.transitBufferMin ?? 20;
+    const tBefore = online ? 0 : (l.transitBeforeMin ?? defTransit);
+    const tAfter  = online ? 0 : (l.transitAfterMin ?? defTransit);
+
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>✏️ Vorlesung & Wegezeit bearbeiten</h3>
+          <form id="edit-lecture-form" class="form-stack">
+            <input type="hidden" name="id" value="${esc(l.id)}">
+            <div class="form-grid">
+              <div>
+                <label>Fach</label>
+                <select name="subjectId">
+                  ${S.subjects.map(s => `<option value="${s.id}" ${s.id === l.subjectId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label>Bezeichnung</label>
+                <input type="text" name="title" value="${esc(l.title)}" required>
+              </div>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Wochentag</label>
+                <select name="weekday">
+                  ${[1, 2, 3, 4, 5, 6].map(w => `<option value="${w}" ${Number(l.weekday) === w ? 'selected' : ''}>${WEEKDAY_NAMES[w]}</option>`).join('')}
+                </select>
+              </div>
+              <div>
+                <label>Startzeit</label>
+                <input type="time" name="start" value="${esc(l.start)}" required>
+              </div>
+              <div>
+                <label>Endzeit</label>
+                <input type="time" name="end" value="${esc(l.end)}" required>
+              </div>
+            </div>
+            <div>
+              <label>Raum / Ort</label>
+              <input type="text" name="room" value="${esc(l.room || '')}" placeholder="Raum oder Online">
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg);border:1px solid var(--ln)">
+              <input type="checkbox" id="edit-lec-online-chk" name="isOnline" ${online ? 'checked' : ''} style="width:17px;height:17px">
+              <label for="edit-lec-online-chk" style="margin:0;cursor:pointer;color:var(--tx);font-weight:600">
+                💻 Online-Veranstaltung (keine Wegezeit vor & nach dieser Veranstaltung)
+              </label>
+            </div>
+            <div class="form-grid" id="edit-lec-transit-row" style="${online ? 'opacity:0.45' : ''}">
+              <div>
+                <label>Wegezeit VOR dieser Vorlesung (Min.)</label>
+                <input type="number" name="transitBeforeMin" value="${tBefore}" min="0" max="120" step="5">
+              </div>
+              <div>
+                <label>Wegezeit NACH dieser Vorlesung (Min.)</label>
+                <input type="number" name="transitAfterMin" value="${tAfter}" min="0" max="120" step="5">
+              </div>
+            </div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+              <button type="button" class="btn" data-action="close-modal">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Änderungen speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  // 4. Außer-Haus-Termin bearbeiten
+  if (m.type === 'event') {
+    const ev = S.events.find(x => x.id === m.id);
+    if (!ev) return '';
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>✏️ Außer-Haus-Termin bearbeiten</h3>
+          <form id="edit-event-form" class="form-stack">
+            <input type="hidden" name="id" value="${esc(ev.id)}">
+            <div>
+              <label>Bezeichnung</label>
+              <input type="text" name="title" value="${esc(ev.title)}" required>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Datum (Von)</label>
+                <input type="date" name="startDate" value="${esc(ev.startDate)}" required>
+              </div>
+              <div>
+                <label>Bis Datum</label>
+                <input type="date" name="endDate" value="${esc(ev.endDate || ev.startDate)}">
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="checkbox" id="edit-ev-allday" name="allDay" ${ev.allDay ? 'checked' : ''} style="width:17px;height:17px">
+              <label for="edit-ev-allday" style="margin:0;cursor:pointer;color:var(--tx)">Ganztägig</label>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Von Uhrzeit</label>
+                <input type="time" name="start" value="${esc(ev.start || '17:00')}">
+              </div>
+              <div>
+                <label>Bis Uhrzeit</label>
+                <input type="time" name="end" value="${esc(ev.end || '19:00')}">
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="checkbox" id="edit-ev-notransit" name="noTransit" ${ev.needsTransit === false ? 'checked' : ''} style="width:17px;height:17px">
+              <label for="edit-ev-notransit" style="margin:0;cursor:pointer;color:var(--tx)">Ohne Wegezeit</label>
+            </div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+              <button type="button" class="btn" data-action="close-modal">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Änderungen speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  // 5. Fach bearbeiten
+  if (m.type === 'subject') {
+    const subj = S.subjects.find(x => x.id === m.id);
+    if (!subj) return '';
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>✏️ Fach bearbeiten</h3>
+          <form id="edit-subject-form" class="form-stack">
+            <input type="hidden" name="id" value="${esc(subj.id)}">
+            <div>
+              <label>Name des Fachs</label>
+              <input type="text" name="name" value="${esc(subj.name)}" required>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label>Credit Points (CP)</label>
+                <input type="number" name="cp" value="${subj.cp ?? 6}" min="1" max="30" step="0.5">
+              </div>
+              <div>
+                <label>Farbe</label>
+                <input type="color" name="color" value="${esc(subj.color || '#3b82f6')}" style="height:38px;padding:2px">
+              </div>
+            </div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+              <button type="button" class="btn" data-action="close-modal">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  // 6. Wegezeit-Slot angeklickt (Punkt 3: Löschen, Verkürzen, Verlängern – heute oder dauerhaft!)
+  if (m.type === 'buffer') {
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>🚶 Wegezeit anpassen (${formatDateNice(m.dateStr)})</h3>
+          <p style="font-size:13px;color:var(--mu);margin-top:0">
+            Wenn du zwischen zwei Vorlesungen in der Uni bleibst oder die Veranstaltung online stattfindet, kannst du die Wegezeit auf <b>0 Minuten</b> setzen, damit dort sofort gelernt werden kann.
+          </p>
+          <form id="edit-buffer-form" class="form-stack">
+            <input type="hidden" name="dateStr" value="${esc(m.dateStr)}">
+            <input type="hidden" name="bufferKey" value="${esc(m.bufferKey)}">
+            <input type="hidden" name="lectureId" value="${esc(m.lectureId || '')}">
+            <input type="hidden" name="position" value="${esc(m.position || '')}">
+
+            <div>
+              <label>Dauer dieser Wegezeit (Minuten, 0 = gelöscht)</label>
+              <input type="number" name="minutes" id="buf-modal-min" value="${m.currentMin}" min="0" max="120" step="5" required>
+            </div>
+
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button type="button" class="btn btn-sm btn-danger" onclick="document.getElementById('buf-modal-min').value=0">0 Min. (Keine Wegezeit)</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('buf-modal-min').value=10">10 Min.</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('buf-modal-min').value=15">15 Min.</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('buf-modal-min').value=20">20 Min.</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('buf-modal-min').value=30">30 Min.</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('buf-modal-min').value=45">45 Min.</button>
+            </div>
+
+            ${m.lectureId ? `
+              <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg);border:1px solid var(--ln)">
+                <input type="checkbox" id="buf-apply-always" name="applyToLectureAlways" style="width:16px;height:16px">
+                <label for="buf-apply-always" style="margin:0;cursor:pointer;color:var(--tx);font-weight:500">
+                  Dauerhaft für diese Vorlesung jede Woche übernehmen
+                </label>
+              </div>
+            ` : ''}
+
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+              <button type="button" class="btn" data-action="close-modal">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  // 7. Erholungspause angeklickt (Punkt 3: Löschen, Verkürzen, Verlängern)
+  if (m.type === 'break') {
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>☕ Erholungspause anpassen (${formatDateNice(m.dateStr)})</h3>
+          <form id="edit-break-form" class="form-stack">
+            <input type="hidden" name="dateStr" value="${esc(m.dateStr)}">
+            <input type="hidden" name="breakKey" value="${esc(m.breakKey)}">
+
+            <div>
+              <label>Dauer dieser Pause (Minuten, 0 = Pause überspringen)</label>
+              <input type="number" name="minutes" id="brk-modal-min" value="${m.currentMin}" min="0" max="90" step="5" required>
+            </div>
+
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button type="button" class="btn btn-sm btn-danger" onclick="document.getElementById('brk-modal-min').value=0">0 Min. (Direkt weiter)</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('brk-modal-min').value=10">10 Min.</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('brk-modal-min').value=15">15 Min.</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('brk-modal-min').value=30">30 Min.</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('brk-modal-min').value=45">45 Min.</button>
+            </div>
+
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg);border:1px solid var(--ln)">
+              <input type="checkbox" id="brk-apply-day" name="applyAllDayBreaks" style="width:16px;height:16px">
+              <label for="brk-apply-day" style="margin:0;cursor:pointer;color:var(--tx);font-weight:500">
+                Für alle Lernpausen an diesem Tag übernehmen
+              </label>
+            </div>
+
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+              <button type="button" class="btn" data-action="close-modal">Abbrechen</button>
+              <button type="submit" class="btn btn-primary">Speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  // 8. Tages-Modal: Block freihalten / Freizeit, Tagespensum (weniger machen) & Mittagspause für diesen Tag (Punkt 3 & 4)
+  if (m.type === 'day') {
+    const dayOvr = getDayOverride(m.dateStr);
+    const defaultMax = S.settings.maxDailyStudyMin ?? 300;
+    const defaultLunch = S.settings.afternoonBreakMin ?? 75;
+    const curLunch = dayOvr.lunchDurationMin !== null && dayOvr.lunchDurationMin !== undefined ? dayOvr.lunchDurationMin : defaultLunch;
+    const curLunchStart = dayOvr.lunchStartMin ? minToTime(dayOvr.lunchStartMin) : '';
+
+    return `
+      <div class="modal-backdrop" data-action="close-modal-bg">
+        <div class="modal" role="dialog" aria-modal="true">
+          <h3>🌴 Tag individuell anpassen: ${formatDateLong(m.dateStr)}</h3>
+
+          <!-- A. Zeitraum / Block freihalten -->
+          <div style="padding:12px;border-radius:10px;background:var(--bg);border:1px solid var(--ln);margin-bottom:14px">
+            <h4 style="margin:0 0 8px;font-size:14px">➕ Zeitblock freihalten (Freizeit ohne Außer-Haus-Termin)</h4>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+              <button type="button" class="btn btn-xs btn-teal" data-action="quick-freeblock" data-date="${m.dateStr}" data-start="08:30" data-end="13:00" data-title="Vormittag frei">🌅 Vormittag frei (08:30–13:00)</button>
+              <button type="button" class="btn btn-xs btn-teal" data-action="quick-freeblock" data-date="${m.dateStr}" data-start="13:00" data-end="17:30" data-title="Nachmittag frei">☀️ Nachmittag frei (13:00–17:30)</button>
+              <button type="button" class="btn btn-xs btn-teal" data-action="quick-freeblock" data-date="${m.dateStr}" data-start="17:00" data-end="20:30" data-title="Abend frei">🌆 Abend frei (17:00–20:30)</button>
+            </div>
+            <form id="add-freeblock-form" class="form-grid" style="align-items:end">
+              <input type="hidden" name="dateStr" value="${esc(m.dateStr)}">
+              <div>
+                <label>Von Uhrzeit</label>
+                <input type="time" name="start" value="14:00" required>
+              </div>
+              <div>
+                <label>Bis Uhrzeit</label>
+                <input type="time" name="end" value="17:00" required>
+              </div>
+              <div>
+                <label>Notiz (optional)</label>
+                <input type="text" name="title" placeholder="Freizeit">
+              </div>
+              <button type="submit" class="btn btn-teal">+ Block freihalten</button>
+            </form>
+
+            ${dayOvr.freeBlocks.length > 0 ? `
+              <div style="margin-top:10px;display:flex;flex-direction:column;gap:5px">
+                ${dayOvr.freeBlocks.map(fb => `
+                  <div style="display:flex;justify-content:space-between;align-items:center;font-size:12.5px;padding:5px 8px;background:var(--sf);border-radius:7px;border:1px solid var(--ln)">
+                    <span>🌴 <b>${minToTime(fb.startMin)} – ${minToTime(fb.endMin)} Uhr</b> · ${esc(fb.title || 'Freizeit')}</span>
+                    <button type="button" class="btn btn-xs btn-danger" data-action="del-freeblock" data-date="${m.dateStr}" data-fbid="${fb.id}">✕</button>
+                  </div>
+                `).join('')}
+              </div>
+            ` : ''}
+          </div>
+
+          <!-- B. Tagespensum & Mittagspause für diesen Tag -->
+          <form id="edit-day-settings-form" class="form-stack">
+            <input type="hidden" name="dateStr" value="${esc(m.dateStr)}">
+
+            <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:var(--bg);border:1px solid var(--ln)">
+              <input type="checkbox" id="day-modal-off-chk" name="isDayOff" ${dayOvr.isDayOff ? 'checked' : ''} style="width:17px;height:17px">
+              <label for="day-modal-off-chk" style="margin:0;cursor:pointer;color:var(--tx);font-weight:600">
+                🌴 Diesen kompletten Tag freihalten (0 Min. Lernzeit)
+              </label>
+            </div>
+
+            <div>
+              <label>Max. Lernpensum an diesem Tag in Minuten (leer = Standard ${defaultMax} Min. / ${formatDuration(defaultMax)})</label>
+              <input type="number" name="maxStudyMin" id="day-modal-max-inp" value="${dayOvr.maxStudyMin ?? ''}" placeholder="Standard (${defaultMax} Min.)" min="0" max="600" step="15">
+              <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px">
+                <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-max-inp').value=60">Nur 1 Std. (60m)</button>
+                <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-max-inp').value=120">Nur 2 Std. (120m)</button>
+                <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-max-inp').value=180">Nur 3 Std. (180m)</button>
+                <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-max-inp').value=''">Standard (${formatDuration(defaultMax)})</button>
+              </div>
+            </div>
+
+            <div class="form-grid">
+              <div>
+                <label>Essens-/Mittagspause heute (Min., 0 = keine)</label>
+                <input type="number" name="lunchDurationMin" id="day-modal-lunch-inp" value="${curLunch}" min="0" max="180" step="15">
+                <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">
+                  <button type="button" class="btn btn-xs btn-danger" onclick="document.getElementById('day-modal-lunch-inp').value=0">0m (Keine)</button>
+                  <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-lunch-inp').value=30">30m</button>
+                  <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-lunch-inp').value=45">45m</button>
+                  <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-lunch-inp').value=60">60m</button>
+                  <button type="button" class="btn btn-xs" onclick="document.getElementById('day-modal-lunch-inp').value=90">90m</button>
+                </div>
+              </div>
+              <div>
+                <label>Feste Uhrzeit Mittagspause (optional)</label>
+                <input type="time" name="lunchStartTime" value="${esc(curLunchStart)}">
+              </div>
+            </div>
+
+            <div style="display:flex;justify-content:space-between;gap:8px;margin-top:8px;flex-wrap:wrap">
+              <button type="button" class="btn btn-sm btn-danger" data-action="reset-day-overrides" data-date="${m.dateStr}">Tages-Anpassungen zurücksetzen</button>
+              <div style="display:flex;gap:8px">
+                <button type="button" class="btn" data-action="close-modal">Schließen</button>
+                <button type="submit" class="btn btn-primary">Tages-Einstellungen speichern</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  return '';
 }
 
 /* --- Event-Listener --- */
@@ -1642,7 +2334,7 @@ document.addEventListener('click', async e => {
   }
 
   if (action === 'select-day') {
-    if (e.target.closest('button') || e.target.closest('select') || e.target.closest('input')) return;
+    if (e.target.closest('button') || e.target.closest('select') || e.target.closest('input') || e.target.closest('.slot-clickable')) return;
     UI.selectedDayStr = btn.dataset.date;
     render();
     return;
@@ -1672,6 +2364,228 @@ document.addEventListener('click', async e => {
     saveState();
     render();
     showToast('Heutiger Plan richtet sich wieder nach der aktuellen Uhrzeit.');
+    return;
+  }
+
+  /* --- Edit-Modals öffnen (Punkt 2, 3, 4) --- */
+  if (action === 'edit-task') {
+    UI.editModal = { type: 'task', id: btn.dataset.id };
+    render();
+    return;
+  }
+  if (action === 'edit-test') {
+    UI.editModal = { type: 'test', id: btn.dataset.id };
+    render();
+    return;
+  }
+  if (action === 'edit-lecture') {
+    UI.editModal = { type: 'lecture', id: btn.dataset.id };
+    render();
+    return;
+  }
+  if (action === 'edit-event') {
+    UI.editModal = { type: 'event', id: btn.dataset.id };
+    render();
+    return;
+  }
+  if (action === 'edit-subject') {
+    UI.editModal = { type: 'subject', id: btn.dataset.id };
+    render();
+    return;
+  }
+  if (action === 'open-day-modal') {
+    UI.editModal = { type: 'day', dateStr: btn.dataset.date, focus: btn.dataset.focus || '' };
+    render();
+    return;
+  }
+  if (action === 'open-buffer-modal') {
+    UI.editModal = {
+      type: 'buffer',
+      dateStr: btn.dataset.date,
+      bufferKey: btn.dataset.bufkey,
+      lectureId: btn.dataset.lecid || '',
+      position: btn.dataset.pos || '',
+      currentMin: Number(btn.dataset.cur) || 20
+    };
+    render();
+    return;
+  }
+  if (action === 'open-break-modal') {
+    UI.editModal = {
+      type: 'break',
+      dateStr: btn.dataset.date,
+      breakKey: btn.dataset.bkey,
+      currentMin: Number(btn.dataset.cur) || 15
+    };
+    render();
+    return;
+  }
+
+  /* --- Wegezeiten & Pausen direkt per Klick verkürzen / verlängern / löschen (Punkt 3) --- */
+  if (action === 'buffer-delete') {
+    const dOvr = getDayOverride(btn.dataset.date);
+    dOvr.bufferOverrides[btn.dataset.bufkey] = 0;
+    saveState();
+    render();
+    showToast('🚶 Wegezeit gelöscht – freie Zeit sofort für den Plan freigegeben!');
+    return;
+  }
+
+  if (action === 'buffer-adjust') {
+    const dOvr = getDayOverride(btn.dataset.date);
+    const cur = Number(btn.dataset.cur) || 20;
+    const delta = Number(btn.dataset.delta) || 0;
+    const next = Math.max(0, cur + delta);
+    dOvr.bufferOverrides[btn.dataset.bufkey] = next;
+    saveState();
+    render();
+    showToast(next === 0 ? '🚶 Wegezeit auf 0 Min. gesetzt!' : `🚶 Wegezeit auf ${next} Min. angepasst!`);
+    return;
+  }
+
+  if (action === 'lunch-delete') {
+    const dOvr = getDayOverride(btn.dataset.date);
+    dOvr.lunchDurationMin = 0;
+    saveState();
+    render();
+    showToast('🍽️ Mittagspause für diesen Tag gestrichen.');
+    return;
+  }
+
+  if (action === 'lunch-adjust') {
+    const dOvr = getDayOverride(btn.dataset.date);
+    const cur = dOvr.lunchDurationMin !== null && dOvr.lunchDurationMin !== undefined
+      ? Number(dOvr.lunchDurationMin)
+      : (Number(S.settings.afternoonBreakMin) || 75);
+    const delta = Number(btn.dataset.delta) || 0;
+    const next = Math.max(0, cur + delta);
+    dOvr.lunchDurationMin = next;
+    saveState();
+    render();
+    showToast(next === 0 ? '🍽️ Mittagspause gestrichen.' : `🍽️ Mittagspause für diesen Tag auf ${next} Min. gesetzt.`);
+    return;
+  }
+
+  if (action === 'break-delete') {
+    const dOvr = getDayOverride(btn.dataset.date);
+    dOvr.breakOverrides[btn.dataset.bkey] = 0;
+    saveState();
+    render();
+    showToast('☕ Erholungspause gelöscht – Lernblöcke schließen direkt an!');
+    return;
+  }
+
+  if (action === 'break-adjust') {
+    const dOvr = getDayOverride(btn.dataset.date);
+    const cur = Number(btn.dataset.cur) || 15;
+    const delta = Number(btn.dataset.delta) || 0;
+    const next = Math.max(0, cur + delta);
+    dOvr.breakOverrides[btn.dataset.bkey] = next;
+    saveState();
+    render();
+    showToast(next === 0 ? '☕ Erholungspause gelöscht.' : `☕ Erholungspause auf ${next} Min. gesetzt.`);
+    return;
+  }
+
+  /* --- Freizeit / Block freihalten / Tag frei / Wochenende frei (Punkt 4) --- */
+  if (action === 'day-toggle-off') {
+    const dateStr = btn.dataset.date;
+    const dOvr = getDayOverride(dateStr);
+    dOvr.isDayOff = !dOvr.isDayOff;
+    saveState();
+    render();
+    showToast(dOvr.isDayOff
+      ? `🌴 ${formatDateNice(dateStr)} als komplett frei markiert – Aufgaben wurden auf andere Tage verschoben!`
+      : `↩ ${formatDateNice(dateStr)} wird wieder normal beplant.`);
+    return;
+  }
+
+  if (action === 'slot-keep-free') {
+    const dateStr = btn.dataset.date;
+    const startMin = Number(btn.dataset.start);
+    const endMin = Number(btn.dataset.end);
+    const dOvr = getDayOverride(dateStr);
+    dOvr.freeBlocks.push({
+      id: uid(),
+      startMin,
+      endMin,
+      title: 'Freizeit (Block freigehalten)'
+    });
+    saveState();
+    render();
+    showToast(`🌴 Zeitraum ${minToTime(startMin)}–${minToTime(endMin)} Uhr freigehalten!`);
+    return;
+  }
+
+  if (action === 'quick-freeblock') {
+    const dateStr = btn.dataset.date;
+    const startMin = timeToMin(btn.dataset.start);
+    const endMin = timeToMin(btn.dataset.end);
+    const dOvr = getDayOverride(dateStr);
+    dOvr.freeBlocks.push({
+      id: uid(),
+      startMin,
+      endMin,
+      title: btn.dataset.title || 'Freizeit'
+    });
+    saveState();
+    render();
+    showToast(`🌴 ${btn.dataset.title} (${btn.dataset.start}–${btn.dataset.end} Uhr) freigehalten!`);
+    return;
+  }
+
+  if (action === 'del-freeblock') {
+    const dateStr = btn.dataset.date;
+    const fbId = btn.dataset.fbid;
+    const dOvr = getDayOverride(dateStr);
+    dOvr.freeBlocks = dOvr.freeBlocks.filter(x => x.id !== fbId);
+    saveState();
+    render();
+    showToast('Freigehaltener Block wieder für Aufgaben freigegeben.');
+    return;
+  }
+
+  if (action === 'reset-day-overrides') {
+    const dateStr = btn.dataset.date;
+    if (S.dayOverrides) delete S.dayOverrides[dateStr];
+    UI.editModal = null;
+    saveState();
+    render();
+    showToast(`Tages-Anpassungen für ${formatDateNice(dateStr)} zurückgesetzt.`);
+    return;
+  }
+
+  if (action === 'weekend-free-toggle') {
+    const todayStr = toDateStr(new Date());
+    const horizon = Number(S.settings.horizonDays) || 10;
+    const weekendDates = [];
+    for (let i = 0; i < horizon; i++) {
+      const d = addDays(todayStr, i);
+      const w = getWeekdayIso(d);
+      if (w === 6 || w === 7) weekendDates.push(d);
+    }
+    const allAlreadyOff = weekendDates.length > 0 && weekendDates.every(d => S.dayOverrides?.[d]?.isDayOff);
+    for (const d of weekendDates) {
+      const ovr = getDayOverride(d);
+      ovr.isDayOff = !allAlreadyOff;
+    }
+    saveState();
+    render();
+    showToast(!allAlreadyOff
+      ? '🌴 Kommendes Wochenende (Sa. & So.) als frei markiert!'
+      : '↩ Wochenende wieder für Aufgaben freigegeben.');
+    return;
+  }
+
+  if (action === 'task-force-active') {
+    const t = S.tasks.find(x => x.id === btn.dataset.id);
+    if (t) {
+      t.waitForLeadWindow = false;
+      t.forceActiveNow = true;
+      saveState();
+      render();
+      showToast(`▶ „${t.title}“ ist jetzt sofort im 10-Tage-Plan aktiv!`);
+    }
     return;
   }
 
@@ -1798,6 +2712,7 @@ document.addEventListener('click', async e => {
   if (action === 'close-modal' || action === 'close-modal-bg') {
     if (action === 'close-modal-bg' && e.target !== btn) return;
     UI.progressModalTaskId = null;
+    UI.editModal = null;
     render();
     return;
   }
@@ -1915,6 +2830,12 @@ document.addEventListener('change', e => {
   if (el.id === 'filter-subj-sel') {
     UI.filterSubjectId = el.value;
     render();
+  } else if (el.id === 'new-task-testid-sel') {
+    const wrap = document.getElementById('new-task-wait-wrap');
+    if (wrap) wrap.style.display = el.value ? 'flex' : 'none';
+  } else if (el.id === 'edit-lec-online-chk') {
+    const row = document.getElementById('edit-lec-transit-row');
+    if (row) row.style.opacity = el.checked ? '0.45' : '1';
   } else if (el.dataset.action === 'subj-color') {
     const subj = S.subjects.find(s => s.id === el.dataset.id);
     if (subj) {
@@ -1936,15 +2857,7 @@ document.addEventListener('change', e => {
       t.relevance = Number(el.value) || 3;
       saveState();
       render();
-      showToast(`Relevanz von „${t.title}“ auf ${t.relevance}/5 gesetzt.`);
-    }
-  } else if (el.dataset.action === 'lec-subj-change') {
-    const lec = S.lectures.find(l => l.id === el.dataset.id);
-    if (lec) {
-      lec.subjectId = el.value;
-      saveState();
-      render();
-      showToast('Fach-Zuordnung der Vorlesung aktualisiert.');
+      showToast(`Priorität von „${t.title}“ auf ${t.relevance}/5 gesetzt.`);
     }
   } else if (el.dataset.action === 'test-leaddays-change') {
     const test = S.tests.find(x => x.id === el.dataset.id);
@@ -1999,7 +2912,6 @@ document.addEventListener('submit', async e => {
     const passHash = await computePasswordHash(username, password);
     UI.authError = '';
 
-    // 1. Falls Netlify Backend aktiv ist -> Kombinierte Anmeldung / Auto-Registrierung auf dem Server
     if (UI.netlifyAvailable) {
       SESSION = { username, passHash };
       const resp = await syncWithNetlify('auth');
@@ -2018,7 +2930,6 @@ document.addEventListener('submit', async e => {
       return;
     }
 
-    // 2. Prüfung über users.json / lokalen Speicher (kein Blockieren auf neuem Gerät!)
     const reg = getLocalUsersRegistry();
     const existingLocal = reg[uKey];
 
@@ -2042,6 +2953,7 @@ document.addEventListener('submit', async e => {
     if (!f.subjectId || !f.subjectId.value) return;
     const min = Math.max(5, Number(f.minutes.value) || 60);
     const rel = Number(f.relevance.value) || 3;
+    const waitWindow = !!(f.testId.value && f.waitForLeadWindow && f.waitForLeadWindow.checked);
     const newTask = {
       id: uid(),
       title: f.title.value.trim(),
@@ -2054,13 +2966,14 @@ document.addEventListener('submit', async e => {
       due: f.due.value || '',
       testId: f.testId.value || '',
       isTestPrep: !!f.testId.value,
+      waitForLeadWindow: waitWindow,
       done: false
     };
     if (!newTask.title) return;
     S.tasks.push(newTask);
     saveState();
     render();
-    showToast(`Aufgabe „${newTask.title}“ eingeplant!`);
+    showToast(`Aufgabe „${newTask.title}“ (Prio ${rel}/5) sofort eingeplant!`);
     return;
   }
 
@@ -2118,6 +3031,7 @@ document.addEventListener('submit', async e => {
         due: newTest.date,
         testId: testId,
         isTestPrep: true,
+        waitForLeadWindow: true,
         done: false
       });
     }
@@ -2131,6 +3045,8 @@ document.addEventListener('submit', async e => {
   if (form.id === 'add-lecture-form') {
     const f = form.elements;
     if (!f.subjectId || !f.subjectId.value) return;
+    const roomStr = f.room.value.trim();
+    const online = f.isOnline.checked || /online|zoom|teams/i.test(roomStr);
     S.lectures.push({
       id: uid(),
       subjectId: f.subjectId.value,
@@ -2138,11 +3054,14 @@ document.addEventListener('submit', async e => {
       weekday: Number(f.weekday.value),
       start: f.start.value,
       end: f.end.value,
-      room: f.room.value.trim()
+      room: roomStr,
+      isOnline: online,
+      transitBeforeMin: online ? 0 : (S.settings.transitBufferMin ?? 20),
+      transitAfterMin: online ? 0 : (S.settings.transitBufferMin ?? 20)
     });
     saveState();
     render();
-    showToast('Vorlesung gespeichert & Wegezeiten reserviert!');
+    showToast(online ? '💻 Online-Vorlesung gespeichert (ohne Wegezeit)!' : '🏛️ Vorlesung gespeichert!');
     return;
   }
 
@@ -2157,11 +3076,12 @@ document.addEventListener('submit', async e => {
       endDate: eDate,
       allDay: f.allDay.checked,
       start: f.start.value || '17:00',
-      end: f.end.value || '19:00'
+      end: f.end.value || '19:00',
+      needsTransit: !f.noTransit?.checked
     });
     saveState();
     render();
-    showToast('Außer-Haus-Termin gespeichert & Lernblöcke verschoben!');
+    showToast('Termin gespeichert & Lernblöcke verschoben!');
     return;
   }
 
@@ -2175,11 +3095,11 @@ document.addEventListener('submit', async e => {
     S.settings.crunchEnd = f.crunchEnd.value || '23:00';
     S.settings.maxDailyStudyMin = Number(f.maxDailyStudyMin.value) || 300;
     S.settings.maxBlockMin = Number(f.maxBlockMin.value) || 60;
-    S.settings.minBreakMin = Number(f.minBreakMin.value) || 15;
-    S.settings.longBreakMin = Number(f.longBreakMin.value) || 30;
-    S.settings.transitBufferMin = Number(f.transitBufferMin) || 20;
-    S.settings.afternoonBreakMin = Number(f.afternoonBreakMin.value) || 75;
-    S.settings.dinnerBreakMin = Number(f.dinnerBreakMin.value) || 45;
+    S.settings.minBreakMin = Math.max(0, Number(f.minBreakMin.value) ?? 15);
+    S.settings.longBreakMin = Math.max(0, Number(f.longBreakMin.value) ?? 30);
+    S.settings.transitBufferMin = Math.max(0, Number(f.transitBufferMin.value) ?? 20);
+    S.settings.afternoonBreakMin = Math.max(0, Number(f.afternoonBreakMin.value) ?? 75);
+    S.settings.dinnerBreakMin = Math.max(0, Number(f.dinnerBreakMin.value) ?? 45);
     S.settings.horizonDays = Number(f.horizonDays.value) || 10;
     saveState();
     render();
@@ -2203,6 +3123,217 @@ document.addEventListener('submit', async e => {
       const subj = getSubject(t.subjectId);
       showToast(`Gespeichert! ${justWorked > 0 ? `+${justWorked} Min. für ${subj.name} gebucht. ` : ''}Restzeit: ${formatDuration(rem)}.`);
     }
+    return;
+  }
+
+  /* --- Edit-Formulare speichern (Punkt 2, 3, 4) --- */
+  if (form.id === 'edit-task-form') {
+    const f = form.elements;
+    const t = S.tasks.find(x => x.id === f.id.value);
+    if (t) {
+      t.title = f.title.value.trim() || t.title;
+      t.subjectId = f.subjectId.value;
+      t.relevance = Number(f.relevance.value) || 3;
+      t.remainingMinutes = Math.max(0, Number(f.remainingMinutes.value) || 0);
+      t.workedMinutes = Math.max(0, Number(f.workedMinutes.value) || 0);
+      t.totalMinutes = Math.max(t.totalMinutes || 60, t.remainingMinutes + t.workedMinutes);
+      t.due = f.due.value || '';
+      t.testId = f.testId.value || '';
+      t.waitForLeadWindow = !!(t.testId && f.waitForLeadWindow.checked);
+      if (!t.waitForLeadWindow) t.forceActiveNow = true;
+      t.done = t.remainingMinutes === 0;
+      UI.editModal = null;
+      saveState();
+      render();
+      showToast(`✏️ Aufgabe „${t.title}“ aktualisiert!`);
+    }
+    return;
+  }
+
+  if (form.id === 'edit-test-form') {
+    const f = form.elements;
+    const test = S.tests.find(x => x.id === f.id.value);
+    if (test) {
+      test.type = f.type.value;
+      test.subjectId = f.subjectId.value;
+      test.title = f.title.value.trim() || test.title;
+      test.date = f.date.value;
+      test.start = f.start.value || '10:00';
+      test.durationMin = test.type === 'bonus_submission' ? 0 : (Number(f.durationMin.value) || 45);
+      test.relevance = Number(f.relevance.value) || 3;
+      test.difficulty = Number(f.difficulty.value) || 3;
+      test.leadDays = Math.max(1, Number(f.leadDays.value) || 14);
+
+      const prepMin = Math.round((Math.max(0, Number(f.prepHours.value) || 0)) * 60);
+      let linkedTask = S.tasks.find(x => x.testId === test.id && shouldTaskWaitForLeadWindow(x)) || S.tasks.find(x => x.testId === test.id && x.isTestPrep);
+
+      if (linkedTask) {
+        linkedTask.title = test.type === 'bonus_submission' ? `Bearbeitung: ${test.title}` : `Vorbereitung: ${test.title}`;
+        linkedTask.subjectId = test.subjectId;
+        linkedTask.relevance = test.relevance;
+        linkedTask.due = test.date;
+        linkedTask.remainingMinutes = prepMin;
+        linkedTask.totalMinutes = Math.max(prepMin, (linkedTask.workedMinutes || 0) + prepMin);
+        linkedTask.done = prepMin === 0;
+      } else if (prepMin > 0) {
+        S.tasks.push({
+          id: uid(),
+          title: test.type === 'bonus_submission' ? `Bearbeitung: ${test.title}` : `Vorbereitung: ${test.title}`,
+          subjectId: test.subjectId,
+          relevance: test.relevance,
+          totalMinutes: prepMin,
+          remainingMinutes: prepMin,
+          workedMinutes: 0,
+          notBefore: '',
+          due: test.date,
+          testId: test.id,
+          isTestPrep: true,
+          waitForLeadWindow: true,
+          done: false
+        });
+      }
+
+      UI.editModal = null;
+      saveState();
+      render();
+      showToast(`✏️ Prüfung „${test.title}“ aktualisiert!`);
+    }
+    return;
+  }
+
+  if (form.id === 'edit-lecture-form') {
+    const f = form.elements;
+    const lec = S.lectures.find(x => x.id === f.id.value);
+    if (lec) {
+      lec.subjectId = f.subjectId.value;
+      lec.title = f.title.value.trim() || lec.title;
+      lec.weekday = Number(f.weekday.value);
+      lec.start = f.start.value;
+      lec.end = f.end.value;
+      lec.room = f.room.value.trim();
+      lec.isOnline = f.isOnline.checked;
+      lec.transitBeforeMin = lec.isOnline ? 0 : Math.max(0, Number(f.transitBeforeMin.value) || 0);
+      lec.transitAfterMin = lec.isOnline ? 0 : Math.max(0, Number(f.transitAfterMin.value) || 0);
+      UI.editModal = null;
+      saveState();
+      render();
+      showToast(`✏️ Vorlesung „${lec.title}“ aktualisiert!`);
+    }
+    return;
+  }
+
+  if (form.id === 'edit-event-form') {
+    const f = form.elements;
+    const ev = S.events.find(x => x.id === f.id.value);
+    if (ev) {
+      ev.title = f.title.value.trim() || ev.title;
+      ev.startDate = f.startDate.value;
+      ev.endDate = f.endDate.value && f.endDate.value >= ev.startDate ? f.endDate.value : ev.startDate;
+      ev.allDay = f.allDay.checked;
+      ev.start = f.start.value || '17:00';
+      ev.end = f.end.value || '19:00';
+      ev.needsTransit = !f.noTransit.checked;
+      UI.editModal = null;
+      saveState();
+      render();
+      showToast(`✏️ Termin „${ev.title}“ aktualisiert!`);
+    }
+    return;
+  }
+
+  if (form.id === 'edit-subject-form') {
+    const f = form.elements;
+    const subj = S.subjects.find(x => x.id === f.id.value);
+    if (subj) {
+      subj.name = f.name.value.trim() || subj.name;
+      subj.cp = Math.max(0, Number(f.cp.value) || 6);
+      subj.color = f.color.value || subj.color;
+      UI.editModal = null;
+      saveState();
+      render();
+      showToast(`✏️ Fach „${subj.name}“ aktualisiert!`);
+    }
+    return;
+  }
+
+  if (form.id === 'edit-buffer-form') {
+    const f = form.elements;
+    const dateStr = f.dateStr.value;
+    const bufKey = f.bufferKey.value;
+    const lecId = f.lectureId.value;
+    const pos = f.position.value;
+    const min = Math.max(0, Number(f.minutes.value) || 0);
+
+    const dOvr = getDayOverride(dateStr);
+    dOvr.bufferOverrides[bufKey] = min;
+
+    if (lecId && f.applyToLectureAlways && f.applyToLectureAlways.checked) {
+      const lec = S.lectures.find(x => x.id === lecId);
+      if (lec) {
+        if (pos === 'before') lec.transitBeforeMin = min;
+        if (pos === 'after') lec.transitAfterMin = min;
+      }
+    }
+
+    UI.editModal = null;
+    saveState();
+    render();
+    showToast(min === 0 ? '🚶 Wegezeit gelöscht!' : `🚶 Wegezeit auf ${min} Min. gesetzt!`);
+    return;
+  }
+
+  if (form.id === 'edit-break-form') {
+    const f = form.elements;
+    const dateStr = f.dateStr.value;
+    const brkKey = f.breakKey.value;
+    const min = Math.max(0, Number(f.minutes.value) || 0);
+
+    const dOvr = getDayOverride(dateStr);
+    dOvr.breakOverrides[brkKey] = min;
+    if (f.applyAllDayBreaks && f.applyAllDayBreaks.checked) {
+      dOvr.studyBreakMin = min;
+    }
+
+    UI.editModal = null;
+    saveState();
+    render();
+    showToast(min === 0 ? '☕ Erholungspause gelöscht!' : `☕ Erholungspause auf ${min} Min. gesetzt!`);
+    return;
+  }
+
+  if (form.id === 'add-freeblock-form') {
+    const f = form.elements;
+    const dateStr = f.dateStr.value;
+    const sMin = timeToMin(f.start.value);
+    const eMin = timeToMin(f.end.value);
+    if (eMin > sMin) {
+      const dOvr = getDayOverride(dateStr);
+      dOvr.freeBlocks.push({
+        id: uid(),
+        startMin: sMin,
+        endMin: eMin,
+        title: f.title.value.trim() || 'Freizeit'
+      });
+      saveState();
+      render();
+      showToast(`🌴 Block ${f.start.value}–${f.end.value} Uhr freigehalten!`);
+    }
+    return;
+  }
+
+  if (form.id === 'edit-day-settings-form') {
+    const f = form.elements;
+    const dateStr = f.dateStr.value;
+    const dOvr = getDayOverride(dateStr);
+    dOvr.isDayOff = f.isDayOff.checked;
+    dOvr.maxStudyMin = f.maxStudyMin.value !== '' ? Math.max(0, Number(f.maxStudyMin.value)) : null;
+    dOvr.lunchDurationMin = f.lunchDurationMin.value !== '' ? Math.max(0, Number(f.lunchDurationMin.value)) : null;
+    dOvr.lunchStartMin = f.lunchStartTime.value ? timeToMin(f.lunchStartTime.value) : null;
+
+    UI.editModal = null;
+    saveState();
+    render();
+    showToast(`⚙️ Tages-Einstellungen für ${formatDateNice(dateStr)} gespeichert!`);
     return;
   }
 });

@@ -14,7 +14,7 @@ const DEFAULT_SETTINGS = {
   maxBlockMin: 60,          // Maximale Länge eines einzelnen Lernblocks (Min.)
   minBreakMin: 15,          // Mindestpause zwischen zwei Lernblöcken (15 Min.)
   longBreakMin: 30,         // Größere Pause nach 2 Blöcken am Stück (30 Min.)
-  transitBufferMin: 20,     // Wegezeit / Gebäudewechsel vor & nach Vorlesungen (Min.)
+  transitBufferMin: 20,     // Standard-Wegezeit vor & nach Präsenz-Vorlesungen (Min.)
   afternoonBreakMin: 75,    // Automatische Essens- & Nachmittagspause (75 Min. = 1,25 Std.)
   dinnerBreakMin: 45,       // Automatische Abendessenspause bei Spätschichten (45 Min.)
   hoursPerCp: 30,           // Standardmäßig 30 Stunden Aufwand pro 1 Credit Point (CP)
@@ -81,6 +81,30 @@ function formatHoursDecimal(min) {
   return Number.isInteger(hrs) ? String(hrs) : hrs.toFixed(1).replace('.', ',');
 }
 
+/* --- Online-Erkennung für Vorlesungen (keine Wegezeit bei Online-Terminen!) --- */
+
+function isLectureOnline(lec) {
+  if (!lec) return false;
+  if (typeof lec.isOnline === 'boolean') return lec.isOnline;
+  const roomStr = String(lec.room || '').trim().toLowerCase();
+  const titleStr = String(lec.title || '').trim().toLowerCase();
+  if (/^(online|zoom|teams|webex|zuhause|home|digital|video|livestream|stream)$/i.test(roomStr)) return true;
+  if (roomStr.includes('online') || roomStr.includes('zoom') || roomStr.includes('teams') || roomStr.includes('zuhause')) return true;
+  if (titleStr.includes('(online)') || titleStr.includes('- online')) return true;
+  return false;
+}
+
+/* --- Prüft, ob eine Aufgabe ein reiner Vorbereitungs-Block ist, der erst X Tage vor der Prüfung starten soll --- */
+
+function shouldTaskWaitForLeadWindow(task) {
+  if (!task || !task.testId) return false;
+  if (task.forceActiveNow) return false;
+  if (typeof task.waitForLeadWindow === 'boolean') return task.waitForLeadWindow;
+  // Rückwärtskompatibilität: Nur automatisch generierte "Vorbereitung: ..." / "Bearbeitung: ..." Aufgaben warten auf das Vorlauffenster.
+  // Normale Übungsaufgaben (wie "Vorrechen Aufgabe 5" oder "Tutoriums Aufgabe 05") starten sofort!
+  return !!(task.isTestPrep && /^(Vorbereitung|Bearbeitung):/i.test(String(task.title || '').trim()));
+}
+
 /* --- Stundenkonto-Berechnung pro Fach (Besuchte Vorlesungen + Bearbeitete Aufgaben) --- */
 
 function computeSubjectHoursAccount(subject, state) {
@@ -142,6 +166,7 @@ function getTestLeadDays(test, settings) {
 function computeSubjectPriorityForDate(subject, dateStr, state) {
   const totalSubjects = Math.max(1, state.subjects.length);
   const rank = subject.baseRank || 1;
+  // Platz #1 bekommt den höchsten Basis-Score, Platz #N den niedrigsten
   const baseScore = (totalSubjects - rank + 1) * 15;
 
   let boostScore = 0;
@@ -201,20 +226,24 @@ function getRankedSubjectsForDate(dateStr, state) {
   return list;
 }
 
-/* --- Individuelle Aufgaben-Relevanz (1 bis 5) --- */
+/* --- Individuelle Aufgaben-Priorität (1 = Sehr gering bis 5 = Sehr wichtig) --- */
 
 function computeTaskEffectiveScore(task, dateStr, subjPrio, state) {
   const baseSubjScore = subjPrio ? subjPrio.baseScore : 45;
   const subjBoost = subjPrio ? subjPrio.boostScore : 0;
-  const taskRel = Number(task.relevance) || 3;
+  const taskRel = Math.max(1, Math.min(5, Number(task.relevance) || 3));
 
-  const relMultipliers = { 1: 0.25, 2: 0.58, 3: 1.0, 4: 1.3, 5: 1.6 };
-  const relOffsets     = { 1: -10,  2: -5,   3: 0,   4: 15,  5: 35 };
+  // Klare, starke Staffelung:
+  // 5/5 (Sehr wichtig) steht immer deutlich über 3/5 (Normal) und erst recht weit über 2/5 (Eher gering) oder 1/5 (Sehr gering)!
+  const relMultipliers = { 1: 0.35, 2: 0.60, 3: 1.00, 4: 1.25, 5: 1.50 };
+  const relOffsets     = { 1: -80,  2: -45,  3: 0,    4: 55,   5: 115  };
 
   const mult = relMultipliers[taskRel] ?? 1.0;
   const offset = relOffsets[taskRel] ?? 0;
 
-  const boostFactor = task.isTestPrep ? 1.0 : (taskRel <= 2 ? 0.25 : 1.0);
+  // Aufgaben mit geringer Relevanz (1/5 oder 2/5, z.B. "Skript lesen") bekommen kaum Prüfungs-Boost,
+  // damit wichtige Übungen (4/5, 5/5) und andere Fächer immer Vorrang haben.
+  const boostFactor = taskRel >= 4 ? 1.15 : (taskRel === 3 ? 1.0 : 0.2);
 
   let score = Math.round(baseSubjScore * mult + offset + subjBoost * boostFactor);
 
@@ -227,15 +256,15 @@ function computeTaskEffectiveScore(task, dateStr, subjPrio, state) {
     }
 
     if (dDue < 0) {
-      score += 200;
+      score += 220;
     } else if (dDue <= maxDueLookahead) {
-      const dueWeight = 0.5 + 0.2 * taskRel;
-      score += Math.round((110 * dueWeight) / (dDue + 0.8));
+      const dueWeight = 0.5 + 0.25 * taskRel;
+      score += Math.round((115 * dueWeight) / (dDue + 0.8));
     }
   }
 
-  if (task.isTestPrep) {
-    score += 15;
+  if (task.isTestPrep && taskRel >= 3) {
+    score += 12;
   }
 
   return score;
@@ -288,7 +317,7 @@ function isTaskEligibleOnDate(task, dateStr, state) {
     return { eligible: false, reason: `Verschoben auf ab ${task.notBefore}` };
   }
 
-  if (task.testId) {
+  if (task.testId && shouldTaskWaitForLeadWindow(task)) {
     const linkedTest = (state.tests || []).find(x => x.id === task.testId);
     if (linkedTest) {
       const deltaDays = daysBetween(dateStr, linkedTest.date);
@@ -297,6 +326,7 @@ function isTaskEligibleOnDate(task, dateStr, state) {
         const startPrepDate = addDays(linkedTest.date, -leadDays);
         return {
           eligible: false,
+          isLeadDeferred: true,
           deferredUntil: startPrepDate,
           reason: `Startet erst ${leadDays} Tage vor ${linkedTest.type === 'exam' ? 'der Klausur' : 'dem Test'} (ab ${startPrepDate})`
         };
@@ -317,6 +347,7 @@ function generateSchedule(state) {
   const horizon = Number(settings.horizonDays) || 10;
   const todayStr = toDateStr(new Date());
   const lecStatus = state.lectureStatus || {};
+  const dayOverridesAll = state.dayOverrides || {};
 
   const activeTasks = (state.tasks || [])
     .filter(t => !t.done && (Number(t.remainingMinutes) || 0) > 0)
@@ -331,21 +362,28 @@ function generateSchedule(state) {
       totalMinutes: Number(t.totalMinutes) || Number(t.remainingMinutes) || 60,
       remainingMinutes: Number(t.remainingMinutes) || 60,
       workedMinutes: Number(t.workedMinutes) || 0,
-      isTestPrep: !!t.isTestPrep
+      isTestPrep: !!t.isTestPrep,
+      waitForLeadWindow: shouldTaskWaitForLeadWindow(t),
+      forceActiveNow: !!t.forceActiveNow
     }));
 
   const days = [];
-  const transitMin = Number(settings.transitBufferMin) || 20;
+  const defaultTransitMin = Number(settings.transitBufferMin) ?? 20;
   const maxBlockMin = Number(settings.maxBlockMin) || 60;
-  const minBreakMin = Number(settings.minBreakMin) || 15;
-  const longBreakMin = Number(settings.longBreakMin) || 30;
-  const afternoonBreakMin = Number(settings.afternoonBreakMin) || 75;
-  const dinnerBreakMin = Number(settings.dinnerBreakMin) || 45;
+  const defaultMinBreakMin = Number(settings.minBreakMin) ?? 15;
+  const defaultLongBreakMin = Number(settings.longBreakMin) ?? 30;
+  const defaultAfternoonBreakMin = Number(settings.afternoonBreakMin) ?? 75;
+  const dinnerBreakMin = Number(settings.dinnerBreakMin) ?? 45;
 
   for (let dIdx = 0; dIdx < horizon; dIdx++) {
     const dateStr = addDays(todayStr, dIdx);
     const weekday = getWeekdayIso(dateStr);
     const isToday = dIdx === 0;
+    const dayOvr = dayOverridesAll[dateStr] || {};
+    const bufferOverrides = dayOvr.bufferOverrides || {};
+    const breakOverrides = dayOvr.breakOverrides || {};
+    const freeBlocks = Array.isArray(dayOvr.freeBlocks) ? dayOvr.freeBlocks : [];
+    const isDayOff = !!dayOvr.isDayOff;
 
     const rankedSubjects = getRankedSubjectsForDate(dateStr, state);
     const subjScoreMap = new Map(rankedSubjects.map(r => [r.subjectId, r]));
@@ -363,6 +401,7 @@ function generateSchedule(state) {
     if (fullDayEvent) {
       timeline.push({
         type: 'event',
+        eventId: fullDayEvent.id,
         startMin: timeToMin(settings.dayStart),
         endMin: timeToMin(settings.dayEnd),
         title: fullDayEvent.title || 'Ganztägig unterwegs / Urlaub',
@@ -375,6 +414,8 @@ function generateSchedule(state) {
         isToday,
         isCrunch: false,
         allDayBlocked: true,
+        isDayOff,
+        maxStudyOverride: dayOvr.maxStudyMin ?? null,
         rankedSubjects,
         timeline,
         skippedLecturesToday,
@@ -399,6 +440,7 @@ function generateSchedule(state) {
 
     const fixedBlocks = [];
 
+    // 1. Wöchentliche Vorlesungen an diesem Wochentag
     const dayLectures = (state.lectures || []).filter(l => Number(l.weekday) === weekday);
     for (const lec of dayLectures) {
       const statusKey = `${lec.id}__${dateStr}`;
@@ -419,9 +461,15 @@ function generateSchedule(state) {
       const sMin = timeToMin(lec.start);
       const eMin = timeToMin(lec.end);
       const subj = (state.subjects || []).find(s => s.id === lec.subjectId);
+      const online = isLectureOnline(lec);
+
+      const defaultBefore = online ? 0 : (lec.transitBeforeMin !== undefined && lec.transitBeforeMin !== null && lec.transitBeforeMin !== '' ? Number(lec.transitBeforeMin) : defaultTransitMin);
+      const defaultAfter  = online ? 0 : (lec.transitAfterMin !== undefined && lec.transitAfterMin !== null && lec.transitAfterMin !== '' ? Number(lec.transitAfterMin) : defaultTransitMin);
+
       if (eMin > sMin) {
         fixedBlocks.push({
           type: 'lecture',
+          blockKey: `lec_${lec.id}`,
           lectureId: lec.id,
           dateStr,
           subjectId: lec.subjectId || '',
@@ -432,29 +480,61 @@ function generateSchedule(state) {
           endMin: eMin,
           durationMin: eMin - sMin,
           title: lec.title,
-          subtitle: lec.room ? `Vorlesung · ${lec.room}` : 'Vorlesung / Übung',
-          needsTransit: true
+          room: lec.room || '',
+          isOnline: online,
+          subtitle: online
+            ? `💻 Online-Veranstaltung${lec.room && lec.room.toLowerCase() !== 'online' ? ` · ${lec.room}` : ''} (keine Wegezeit)`
+            : (lec.room ? `Vorlesung · ${lec.room}` : 'Vorlesung / Übung'),
+          transitBeforeMin: Math.max(0, defaultBefore),
+          transitAfterMin: Math.max(0, defaultAfter)
         });
       }
     }
 
+    // 2. Außer-Haus-Termine
     for (const ev of dayEvents) {
       if (!ev.allDay && ev.start && ev.end) {
         const sMin = timeToMin(ev.start);
         const eMin = timeToMin(ev.end);
+        const hasTransit = ev.needsTransit !== false;
         if (eMin > sMin) {
           fixedBlocks.push({
             type: 'event',
+            blockKey: `ev_${ev.id}`,
+            eventId: ev.id,
+            dateStr,
             startMin: sMin,
             endMin: eMin,
             title: ev.title,
-            subtitle: 'Außer-Haus-Termin / Freizeit',
-            needsTransit: ev.needsTransit !== false
+            subtitle: 'Außer-Haus-Termin',
+            transitBeforeMin: hasTransit ? defaultTransitMin : 0,
+            transitAfterMin: hasTransit ? defaultTransitMin : 0
           });
         }
       }
     }
 
+    // 3. Manuell freigehaltene Freizeit-Blöcke ("🌴 Block freihalten" – ohne Wegezeit!)
+    for (const fb of freeBlocks) {
+      const sMin = Number(fb.startMin) || 0;
+      const eMin = Number(fb.endMin) || 0;
+      if (eMin > sMin) {
+        fixedBlocks.push({
+          type: 'freeblock',
+          blockKey: `fb_${fb.id}`,
+          freeBlockId: fb.id,
+          dateStr,
+          startMin: sMin,
+          endMin: eMin,
+          title: fb.title || 'Freizeit / Block freigehalten',
+          subtitle: 'Freigehaltener Zeitraum – keine Aufgaben hier',
+          transitBeforeMin: 0,
+          transitAfterMin: 0
+        });
+      }
+    }
+
+    // 4. Prüfungen & Abgaben an diesem Tag
     const dayTests = (state.tests || []).filter(t => t.date === dateStr);
     for (const test of dayTests) {
       const subj = (state.subjects || []).find(s => s.id === test.subjectId);
@@ -462,13 +542,17 @@ function generateSchedule(state) {
         const dueMin = timeToMin(test.start || '18:00');
         fixedBlocks.push({
           type: 'test',
+          blockKey: `test_${test.id}`,
+          testId: test.id,
+          dateStr,
           isSubmissionDeadline: true,
           startMin: dueMin,
           endMin: dueMin,
           title: `📥 Abgabefrist: ${test.title}`,
           subtitle: `${subj ? subj.name : ''} · Bonuspunkte-Abgabe (R:${test.relevance}/5, S:${test.difficulty}/5)`,
           color: subj ? subj.color : '#f59e0b',
-          needsTransit: false
+          transitBeforeMin: 0,
+          transitAfterMin: 0
         });
       } else {
         const sMin = timeToMin(test.start || '10:00');
@@ -476,44 +560,71 @@ function generateSchedule(state) {
         const eMin = sMin + dur;
         fixedBlocks.push({
           type: 'test',
+          blockKey: `test_${test.id}`,
+          testId: test.id,
+          dateStr,
           startMin: sMin,
           endMin: eMin,
           title: `${test.type === 'exam' ? 'Klausur' : 'Bonuspunkte-Test'}: ${test.title}`,
           subtitle: `${subj ? subj.name : ''} · Relevanz ${test.relevance}/5 · Schwierigkeit ${test.difficulty}/5`,
           color: subj ? subj.color : '#ef4444',
-          needsTransit: true
+          transitBeforeMin: defaultTransitMin,
+          transitAfterMin: defaultTransitMin
         });
       }
     }
 
     fixedBlocks.sort((a, b) => a.startMin - b.startMin);
 
+    // Wegezeiten (Buffers) berechnen – individuell pro Termin & Tag anpassbar/löschbar!
     const bufferBlocks = [];
     const realFixedBlocks = fixedBlocks.filter(b => b.endMin > b.startMin);
-    if (transitMin > 0) {
-      for (let i = 0; i < realFixedBlocks.length; i++) {
-        const blk = realFixedBlocks[i];
-        if (!blk.needsTransit) continue;
 
+    for (let i = 0; i < realFixedBlocks.length; i++) {
+      const blk = realFixedBlocks[i];
+      const beforeKey = `${blk.blockKey}__before`;
+      const afterKey  = `${blk.blockKey}__after`;
+
+      const rawBefore = bufferOverrides[beforeKey] !== undefined
+        ? Number(bufferOverrides[beforeKey])
+        : (blk.transitBeforeMin || 0);
+
+      const rawAfter = bufferOverrides[afterKey] !== undefined
+        ? Number(bufferOverrides[afterKey])
+        : (blk.transitAfterMin || 0);
+
+      if (rawBefore > 0) {
         const prevEnd = i > 0 ? realFixedBlocks[i - 1].endMin : 0;
-        const bufBeforeStart = Math.max(prevEnd, blk.startMin - transitMin);
-        if (blk.startMin - bufBeforeStart >= 10) {
+        const bufBeforeStart = Math.max(prevEnd, blk.startMin - rawBefore);
+        if (blk.startMin - bufBeforeStart >= 5) {
           bufferBlocks.push({
             type: 'buffer',
+            bufferKey: beforeKey,
+            lectureId: blk.lectureId || '',
+            position: 'before',
+            dateStr,
             startMin: bufBeforeStart,
             endMin: blk.startMin,
+            configuredMin: rawBefore,
             title: 'Wegezeit / Gebäudewechsel',
             subtitle: `Vor ${blk.title}`
           });
         }
+      }
 
+      if (rawAfter > 0) {
         const nextStart = i + 1 < realFixedBlocks.length ? realFixedBlocks[i + 1].startMin : 24 * 60;
-        const bufAfterEnd = Math.min(nextStart, blk.endMin + transitMin);
-        if (bufAfterEnd - blk.endMin >= 10) {
+        const bufAfterEnd = Math.min(nextStart, blk.endMin + rawAfter);
+        if (bufAfterEnd - blk.endMin >= 5) {
           bufferBlocks.push({
             type: 'buffer',
+            bufferKey: afterKey,
+            lectureId: blk.lectureId || '',
+            position: 'after',
+            dateStr,
             startMin: blk.endMin,
             endMin: bufAfterEnd,
+            configuredMin: rawAfter,
             title: 'Wegezeit / Pause nach Termin',
             subtitle: `Nach ${blk.title}`
           });
@@ -530,24 +641,68 @@ function generateSchedule(state) {
       for (const b of realFixedBlocks) free = subtractInterval(free, b.startMin, b.endMin);
       for (const b of bufferBlocks) free = subtractInterval(free, b.startMin, b.endMin);
       for (const b of (extraBlocked || [])) free = subtractInterval(free, b.startMin, b.endMin);
-      return free.filter(([s, e]) => e - s >= 20);
+      return free.filter(([s, e]) => e - s >= 15);
     };
 
+    // Automatische oder individuell angepasste Essens- & Nachmittagspause
     const autoMeals = [];
-    if (dayStartMin < 15 * 60 && afternoonBreakMin > 0) {
-      const prelimFree = buildFreeIntervals(Math.max(dayStartMin, 11 * 60 + 45), Math.max(normalEndMin, 17 * 60), []);
-      const lunchSlot = findAutomaticBreakWindow(prelimFree, 12 * 60, 16 * 60 + 30, afternoonBreakMin);
+    const lunchDur = dayOvr.lunchDurationMin !== undefined && dayOvr.lunchDurationMin !== null
+      ? Number(dayOvr.lunchDurationMin)
+      : defaultAfternoonBreakMin;
+
+    if (dayStartMin < 15 * 60 + 30 && lunchDur > 0 && !isDayOff) {
+      let lunchSlot = null;
+      if (dayOvr.lunchStartMin !== undefined && dayOvr.lunchStartMin !== null && dayOvr.lunchStartMin !== '') {
+        const customStart = Number(dayOvr.lunchStartMin);
+        lunchSlot = [customStart, customStart + lunchDur];
+      } else {
+        const prelimFree = buildFreeIntervals(Math.max(dayStartMin, 11 * 60 + 30), Math.max(normalEndMin, 17 * 60), []);
+        lunchSlot = findAutomaticBreakWindow(prelimFree, 12 * 60, 16 * 60 + 30, lunchDur);
+      }
+
       if (lunchSlot) {
         const mealBlock = {
           type: 'meal',
+          mealKey: 'lunch',
+          dateStr,
           startMin: lunchSlot[0],
           endMin: lunchSlot[1],
+          durationMin: lunchDur,
           title: 'Essens- & Nachmittagspause',
-          subtitle: `${afternoonBreakMin} Min. automatisch freigehalten`
+          subtitle: `${lunchDur} Min. (anklicken zum Ändern/Löschen)`
         };
         autoMeals.push(mealBlock);
         timeline.push(mealBlock);
       }
+    }
+
+    // Falls "🌴 Tag frei" aktiviert ist -> keine Lernblöcke an diesem Tag einplanen!
+    if (isDayOff) {
+      timeline.push({
+        type: 'freeblock',
+        isFullDayOffBanner: true,
+        dateStr,
+        startMin: dayStartMin,
+        endMin: normalEndMin,
+        allDay: true,
+        title: '🌴 Freier Tag (Freizeit)',
+        subtitle: 'Für heute sind alle Lernblöcke deaktiviert – erhol dich gut!'
+      });
+      timeline.sort((a, b) => a.startMin - b.startMin);
+      days.push({
+        dateStr,
+        weekday,
+        isToday,
+        isCrunch: false,
+        allDayBlocked: false,
+        isDayOff: true,
+        maxStudyOverride: dayOvr.maxStudyMin ?? null,
+        rankedSubjects,
+        timeline,
+        skippedLecturesToday,
+        studyMinutesPlanned: 0
+      });
+      continue;
     }
 
     const pickBestTaskForDay = (currentSlotStartMin) => {
@@ -580,14 +735,18 @@ function generateSchedule(state) {
 
     let studyMinutesToday = 0;
     let consecutiveBlocks = 0;
-    const maxNormalStudy = Number(settings.maxDailyStudyMin) || 300;
+    let breakSlotIndex = 0;
+
+    const maxNormalStudy = (dayOvr.maxStudyMin !== undefined && dayOvr.maxStudyMin !== null && dayOvr.maxStudyMin !== '')
+      ? Number(dayOvr.maxStudyMin)
+      : (Number(settings.maxDailyStudyMin) || 300);
 
     const scheduleIntoFreeWindows = (freeWindows, dailyCapMin, isCrunchWindow = false) => {
       for (const [winStart, winEnd] of freeWindows) {
         let cursor = winStart;
         consecutiveBlocks = 0;
 
-        while (cursor + 20 <= winEnd && studyMinutesToday < dailyCapMin) {
+        while (cursor + 15 <= winEnd && studyMinutesToday < dailyCapMin) {
           const pick = pickBestTaskForDay(cursor);
           if (!pick) break;
 
@@ -634,14 +793,31 @@ function generateSchedule(state) {
 
           const moreTasksWaiting = activeTasks.some(t => t.remainingMinutes > 0 && isTaskEligibleOnDate(t, dateStr, state).eligible);
           if (moreTasksWaiting && studyMinutesToday < dailyCapMin) {
-            const breakLen = (consecutiveBlocks >= 2 || blockLen >= 60) ? longBreakMin : minBreakMin;
-            if (cursor + breakLen + 20 <= winEnd) {
+            breakSlotIndex++;
+            const breakKey = `brk_${breakSlotIndex}`;
+            const defaultBrk = (consecutiveBlocks >= 2 || blockLen >= 60) ? defaultLongBreakMin : defaultMinBreakMin;
+            const customDayBrk = (dayOvr.studyBreakMin !== undefined && dayOvr.studyBreakMin !== null && dayOvr.studyBreakMin !== '')
+              ? Number(dayOvr.studyBreakMin)
+              : defaultBrk;
+            const breakLen = breakOverrides[breakKey] !== undefined
+              ? Number(breakOverrides[breakKey])
+              : customDayBrk;
+
+            if (breakLen <= 0) {
+              // Pause wurde vom Nutzer auf 0 Min. gesetzt -> direkt weiterarbeiten!
+              continue;
+            }
+
+            if (cursor + breakLen + 15 <= winEnd) {
               timeline.push({
                 type: 'break',
+                breakKey,
+                dateStr,
                 startMin: cursor,
                 endMin: cursor + breakLen,
+                durationMin: breakLen,
                 title: `Erholungspause (${breakLen} Min.)`,
-                subtitle: consecutiveBlocks >= 2 ? 'Große Pause nach 2 Lernblöcken' : 'Kurze Pause zwischen Lernblöcken'
+                subtitle: 'Anklicken zum Ändern/Löschen'
               });
               cursor += breakLen;
             } else {
@@ -655,6 +831,8 @@ function generateSchedule(state) {
     const normalFree = buildFreeIntervals(dayStartMin, normalEndMin, autoMeals);
     scheduleIntoFreeWindows(normalFree, maxNormalStudy, false);
 
+    // Crunch-Mode nur, wenn an diesem Tag kein manuelles Weniger-Limit gesetzt wurde
+    const hasManualDailyCap = (dayOvr.maxStudyMin !== undefined && dayOvr.maxStudyMin !== null && dayOvr.maxStudyMin !== '');
     const hasUrgentTestSoon = (state.tests || []).some(t => {
       const diff = daysBetween(dateStr, t.date);
       return diff >= 0 && diff <= 2;
@@ -675,13 +853,16 @@ function generateSchedule(state) {
       return sp && sp.boostScore >= 55;
     });
 
-    if ((hasUrgentTestSoon || hasUrgentTaskDeadlineSoon) && stillUrgentWorkLeft && crunchEndMin > normalEndMin) {
+    if (!hasManualDailyCap && (hasUrgentTestSoon || hasUrgentTaskDeadlineSoon) && stillUrgentWorkLeft && crunchEndMin > normalEndMin) {
       const eveStart = Math.max(dayStartMin, normalEndMin);
       if (crunchEndMin - eveStart >= 45) {
         const dinnerBlock = {
           type: 'meal',
+          mealKey: 'dinner',
+          dateStr,
           startMin: eveStart,
           endMin: Math.min(crunchEndMin, eveStart + dinnerBreakMin),
+          durationMin: dinnerBreakMin,
           title: 'Abendessenspause',
           subtitle: 'Automatische Pause vor Abendschicht'
         };
@@ -708,6 +889,8 @@ function generateSchedule(state) {
       isToday,
       isCrunch,
       allDayBlocked: false,
+      isDayOff: false,
+      maxStudyOverride: dayOvr.maxStudyMin ?? null,
       rankedSubjects,
       timeline,
       skippedLecturesToday,
