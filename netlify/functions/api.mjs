@@ -54,7 +54,6 @@ export default async (req) => {
     const userKey = `user_${cleanUser}`;
     const existing = await store.get(userKey, { type: "json" });
 
-    // Kombinierter Login / Auto-Registrierung falls Benutzername noch frei ist
     if (action === "auth" || action === "login" || action === "register") {
       if (existing) {
         if (existing.passHash !== passHash) {
